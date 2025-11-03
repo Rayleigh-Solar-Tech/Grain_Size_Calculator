@@ -33,17 +33,11 @@ class ExactFooterOCR:
                     if img is None:
                         raise ValueError(f"Could not read image: {image_path}")
             
-            # Debug: Print image info
-            print(f"🔍 Debug - Loaded image shape: {img.shape}, dtype: {img.dtype}")
-            
             height, width = img.shape[:2]
             
             # Extract larger bottom footer region (15% instead of 5% to capture more text)
             footer_height = max(int(height * footer_height_ratio), 100)  # Minimum 100px
             footer_region = img[-footer_height:, :]
-            
-            print(f"🔍 Debug - Footer region shape: {footer_region.shape}")
-            print(f"🔍 Debug - Footer height: {footer_height}px ({footer_height_ratio*100:.1f}% of image)")
             
             return footer_region, (width, height)
             
@@ -52,113 +46,56 @@ class ExactFooterOCR:
             raise
 
     def preprocess_footer_for_ocr(self, footer_img):
-        """Advanced preprocessing for SEM footer OCR with improved handling."""
+        """Optimized preprocessing for SEM footer OCR - only essential methods."""
         # Ensure we have the right image format
         if footer_img is None:
             raise ValueError("Footer image is None")
         
-        print(f"🔍 Debug - Processing image shape: {footer_img.shape}")
-        
         # Convert to grayscale if needed
         if len(footer_img.shape) == 3:
-            # Check if it's BGR (OpenCV default) or RGB
             if footer_img.shape[2] == 3:
                 gray = cv2.cvtColor(footer_img, cv2.COLOR_BGR2GRAY)
             elif footer_img.shape[2] == 4:
                 gray = cv2.cvtColor(footer_img, cv2.COLOR_BGRA2GRAY)
-            elif footer_img.shape[2] == 1:
-                # Single channel image - squeeze the last dimension
-                gray = footer_img.squeeze(axis=2)
             else:
-                raise ValueError(f"Unexpected number of channels: {footer_img.shape[2]}")
-        elif len(footer_img.shape) == 2:
-            # Already grayscale
-            gray = footer_img.copy()
+                gray = footer_img.squeeze(axis=2)
         else:
-            raise ValueError(f"Unexpected image shape: {footer_img.shape}")
-        
-        print(f"🔍 Debug - Grayscale image shape: {gray.shape}")
+            gray = footer_img.copy()
         
         processed_images = []
         
-        # Method 1: Enhanced contrast for white text on dark background
+        # Method 1: Enhanced contrast (works for most SEM footers)
         enhanced = cv2.convertScaleAbs(gray, alpha=2.5, beta=30)
         processed_images.append(enhanced)
         
-        # Method 2: Invert if the footer has light text on dark background
-        # Check if image is predominantly dark (SEM footers often are)
+        # Method 2: Invert for dark backgrounds (common in SEM)
         mean_intensity = np.mean(gray)
-        if mean_intensity < 128:  # Dark background
-            inverted = cv2.bitwise_not(gray)
+        if mean_intensity < 128:
+            inverted = cv2.bitwise_not(enhanced)
             processed_images.append(inverted)
         
-        # Method 3: CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        clahe_img = clahe.apply(gray)
-        processed_images.append(clahe_img)
-        
-        # Method 4: Apply adaptive threshold
-        adaptive_thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                              cv2.THRESH_BINARY, 11, 2)
-        processed_images.append(adaptive_thresh)
-        
-        # Method 5: Apply OTSU threshold
+        # Method 3: OTSU threshold (reliable for text extraction)
         _, otsu_thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         processed_images.append(otsu_thresh)
-        
-        # Method 6: Morphological operations to clean up
-        kernel = np.ones((2,2), np.uint8)
-        morphed = cv2.morphologyEx(otsu_thresh, cv2.MORPH_CLOSE, kernel)
-        processed_images.append(morphed)
-        
-        # Method 7: Gaussian blur + threshold for noise reduction
-        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
-        _, blur_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        processed_images.append(blur_thresh)
-        
-        # Method 8: Upscale for better OCR (small text)
-        height, width = gray.shape
-        if height < 200:  # If footer is small, upscale
-            scale_factor = 3
-            upscaled = cv2.resize(enhanced, (width * scale_factor, height * scale_factor), 
-                                interpolation=cv2.INTER_CUBIC)
-            processed_images.append(upscaled)
         
         return processed_images
 
     def perform_ocr_with_multiple_methods(self, footer_img):
-        """Perform OCR with multiple preprocessing methods."""
+        """Optimized OCR with only the most effective configurations."""
         all_results = []
         
-        # Different preprocessing methods
+        # Get preprocessed images (now only 3 methods instead of 8)
         processed_imgs = self.preprocess_footer_for_ocr(footer_img)
         
-        # Different OCR configurations - improved for SEM footer text
+        # Only the most effective OCR configurations (4 instead of 13)
         ocr_configs = [
-            # Page segmentation modes optimized for SEM footers
-            '--psm 6 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single uniform block
-            '--psm 7 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single text line
-            '--psm 8 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single word
-            '--psm 13 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ', # Raw line (no formatting)
-            
-            # Without character whitelist (in case special chars are causing issues)
-            '--psm 6',
-            '--psm 7', 
-            '--psm 8',
-            '--psm 13',
-            
-            # Legacy engine for different text styles
-            '--psm 6 --oem 0',
-            '--psm 7 --oem 0',
-            
-            # Sparse text mode for scattered elements
-            '--psm 11',
-            '--psm 12',
-            
-            # Default auto mode
-            '--psm 3',
+            '--psm 6 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single block with whitelist
+            '--psm 7 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single line with whitelist
+            '--psm 6',  # Single block without whitelist
+            '--psm 7',  # Single line without whitelist
         ]
         
+        # Total OCR attempts: 3 preprocessing × 4 configs = 12 (down from 104!)
         for i, processed_img in enumerate(processed_imgs):
             for j, config in enumerate(ocr_configs):
                 try:
@@ -170,6 +107,9 @@ class ExactFooterOCR:
                             'ocr_config': f'config_{j}',
                             'confidence': len(text)
                         })
+                        # If we found text with Frame Width, stop early
+                        if 'FW' in text or 'Fw' in text or 'μm' in text or 'um' in text:
+                            return all_results  # Early exit when we find relevant text
                 except Exception as e:
                     continue
         
@@ -265,8 +205,6 @@ class ExactFooterOCR:
         Returns dictionary with metadata and calculated pixel size.
         """
         try:
-            print(f"🔍 Starting OCR analysis for: {image_path}")
-            
             # Extract footer region
             footer_region, image_size = self.extract_footer_region(image_path)
             
@@ -284,8 +222,6 @@ class ExactFooterOCR:
             if 'fw_um' in metadata and image_size:
                 um_per_pixel = metadata['fw_um'] / image_size[0]  # Frame width / image width
             
-            print(f"✅ OCR analysis completed successfully")
-            
             return {
                 'image_path': image_path,
                 'image_size': image_size,
@@ -297,7 +233,6 @@ class ExactFooterOCR:
             
         except Exception as e:
             error_msg = f"Error analyzing SEM footer: {e}"
-            print(f"❌ {error_msg}")
             self.logger.error(error_msg)
             import traceback
             traceback.print_exc()
@@ -342,32 +277,21 @@ class ExactFooterOCR:
         Returns frame width in micrometers or None if not found.
         """
         try:
-            print(f"🔍 Extracting frame width from: {os.path.basename(image_path)}")
-            
             # Use the comprehensive analysis method
             results = self.analyze_sem_footer_exact(image_path)
             
             if 'error' in results:
-                print(f"❌ Error in frame width extraction: {results['error']}")
                 return None
             
             metadata = results.get('metadata', {})
             frame_width = metadata.get('fw_um')
             
             if frame_width:
-                print(f"✅ Frame width detected: {frame_width} μm")
                 return frame_width
             else:
-                print("⚠️ Frame width not found in image footer")
-                
-                # Debug: Print what was extracted
-                if 'ocr_text' in results:
-                    print(f"🔍 OCR Text found: {results['ocr_text'][:200]}...")
-                
                 return None
                 
         except Exception as e:
-            print(f"❌ Exception in extract_frame_width: {e}")
             import traceback
             traceback.print_exc()
             return None
