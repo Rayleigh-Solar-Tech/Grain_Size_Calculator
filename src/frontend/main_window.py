@@ -37,6 +37,8 @@ class MainWindow(QMainWindow):
         self.current_image_path = ""
         self.image_list = []  # List of image paths for batch processing
         self.current_batch_index = 0  # Current processing index
+        self.is_batch_processing = False  # Flag to indicate batch processing mode
+        self._updating_image_path = False  # Flag to prevent recursive calls
         self.results = []
         self.exact_ocr = create_exact_footer_ocr()  # Initialize exact OCR processor
         self.pinhole_detector = create_pinhole_detector()  # Initialize pinhole detector
@@ -165,17 +167,14 @@ class MainWindow(QMainWindow):
         self.image_list_widget.setMaximumHeight(120)
         self.image_list_widget.itemClicked.connect(self.on_image_list_selection)
         
-        # Batch processing controls
+        # Batch processing controls (Semi-automated mode)
         batch_layout = QHBoxLayout()
-        self.automate_check = QCheckBox("🤖 Automate Processing")
-        self.automate_check.setChecked(False)
-        self.automate_check.setToolTip("Automatically detect pinholes and grains for all images without user input")
         
         self.process_all_button = QPushButton("🚀 Process All Images")
         self.process_all_button.clicked.connect(self.process_all_images)
         self.process_all_button.setEnabled(False)
+        self.process_all_button.setToolTip("Semi-automated batch processing: Auto-detects everything, prompts only when Frame Width detection fails")
         
-        batch_layout.addWidget(self.automate_check)
         batch_layout.addWidget(self.process_all_button)
         
         image_layout.addWidget(QLabel("Single Image:"))
@@ -201,7 +200,7 @@ class MainWindow(QMainWindow):
         self.frame_width_spinbox.setValue(21.8)
         self.frame_width_spinbox.setSuffix(" µm")
         self.frame_width_spinbox.setEnabled(False)
-        self.frame_width_spinbox.setToolTip("Manual Frame Width input (enabled when auto-detection is off)")
+        self.frame_width_spinbox.setToolTip("Manual Frame Width input - UNCHECK the auto-detect checkbox above to enable this field")
         
         self.detect_scale_button = QPushButton("🔍 Detect Scale from Footer")
         self.detect_scale_button.clicked.connect(self.detect_scale)
@@ -387,8 +386,55 @@ class MainWindow(QMainWindow):
     
     def on_image_path_changed(self, path):
         """Handle image path change."""
+        # Prevent recursive calls
+        if self._updating_image_path:
+            return
+        
         self.current_image_path = path
         if path and os.path.exists(path):
+            # Quick validation first
+            try:
+                test_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if test_img is None:
+                    self.log_message(f"❌ Error: Cannot read image file")
+                    QMessageBox.critical(
+                        self,
+                        "Invalid Image",
+                        f"❌ Cannot read image file:\n{os.path.basename(path)}\n\n"
+                        f"Please select a valid image file (TIFF, PNG, JPG, BMP)."
+                    )
+                    self.image_preview_label.setText("Invalid image file")
+                    self.analyze_button.setEnabled(False)
+                    self.detect_pinholes_button.setEnabled(False)
+                    return
+                
+                # Check if image is too small
+                if test_img.shape[0] < 100 or test_img.shape[1] < 100:
+                    self.log_message(f"❌ Error: Image too small ({test_img.shape[1]}x{test_img.shape[0]})")
+                    QMessageBox.warning(
+                        self,
+                        "Image Too Small",
+                        f"⚠️ Image is too small for analysis:\n{test_img.shape[1]}x{test_img.shape[0]} pixels\n\n"
+                        f"Minimum required: 100x100 pixels"
+                    )
+                    self.image_preview_label.setText("Image too small")
+                    self.analyze_button.setEnabled(False)
+                    self.detect_pinholes_button.setEnabled(False)
+                    return
+                    
+            except Exception as e:
+                self.log_message(f"❌ Error loading image: {str(e)}")
+                QMessageBox.critical(
+                    self,
+                    "Image Load Error",
+                    f"❌ Error loading image:\n{str(e)}\n\n"
+                    f"Please select a valid SEM image file."
+                )
+                self.image_preview_label.setText("Error loading image")
+                self.analyze_button.setEnabled(False)
+                self.detect_pinholes_button.setEnabled(False)
+                return
+            
             self.load_image_preview(path)
             self.log_message(f"Image loaded: {os.path.basename(path)}")
             
@@ -396,9 +442,14 @@ class MainWindow(QMainWindow):
             self.analyze_button.setEnabled(True)
             self.detect_pinholes_button.setEnabled(True)
             
-            # Automatically detect scale if auto-OCR is enabled
-            if self.auto_ocr_check.isChecked():
-                self.auto_detect_scale_from_footer()
+            # Automatically detect scale if auto-OCR is enabled (with delay to prevent freeze)
+            # BUT SKIP if we're in batch processing mode (it will handle detection itself)
+            if self.auto_ocr_check.isChecked() and not self.is_batch_processing:
+                self.log_message("🔄 ASYNC auto-detection triggered (NOT in batch mode)")
+                # Use QTimer to run OCR asynchronously after UI updates
+                QTimer.singleShot(100, self.auto_detect_scale_from_footer)
+            elif self.is_batch_processing:
+                self.log_message("⏭️ SKIPPING async auto-detection (in batch processing mode)")
         else:
             self.image_preview_label.setText("No image loaded")
             self.analyze_button.setEnabled(False)
@@ -410,9 +461,32 @@ class MainWindow(QMainWindow):
         if checked:
             self.scale_status_label.setText("Status: Auto-detection enabled")
             self.scale_status_label.setStyleSheet("color: #4CAF50; font-style: italic;")
+            # Reset spinbox background when auto-detection is enabled
+            self.frame_width_spinbox.setStyleSheet("")
         else:
-            self.scale_status_label.setText("Status: Manual input mode")
-            self.scale_status_label.setStyleSheet("color: #FF9800; font-style: italic;")
+            self.scale_status_label.setText("Status: Manual input mode - Enter Frame Width below")
+            self.scale_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+            # Highlight the spinbox to draw attention
+            self.frame_width_spinbox.setStyleSheet("background-color: #FFF3E0; border: 2px solid #FF9800;")
+    
+    def prompt_manual_input_mode(self):
+        """Switch to manual input mode and highlight it when auto-detection fails."""
+        # Uncheck auto-detection to enable manual input
+        self.auto_ocr_check.setChecked(False)
+        # This will trigger on_auto_ocr_toggled which handles the highlighting
+        
+        # Show a brief message
+        self.log_message("🔧 Switched to MANUAL input mode - please enter Frame Width manually")
+        
+        # Flash the spinbox to draw attention
+        original_style = self.frame_width_spinbox.styleSheet()
+        flash_style = "background-color: #FFEB3B; border: 3px solid #FFC107; font-weight: bold;"
+        self.frame_width_spinbox.setStyleSheet(flash_style)
+        
+        # Return to normal highlight after 2 seconds
+        QTimer.singleShot(2000, lambda: self.frame_width_spinbox.setStyleSheet(
+            "background-color: #FFF3E0; border: 2px solid #FF9800;"
+        ))
     
     def browse_multiple_images(self):
         """Browse and select multiple SEM images."""
@@ -459,42 +533,25 @@ class MainWindow(QMainWindow):
                 self.log_message(f"📂 Selected: {os.path.basename(selected_path)}")
     
     def process_all_images(self):
-        """Process all images in the queue."""
+        """Process all images in the queue using semi-automated workflow."""
         if not self.image_list:
             QMessageBox.warning(self, "Warning", "No images in queue to process.")
             return
         
-        automate_enabled = self.automate_check.isChecked()
-        
-        if automate_enabled:
-            # Automated processing
-            reply = QMessageBox.question(
-                self,
-                "Automated Batch Processing",
-                f"🤖 Ready to automatically process {len(self.image_list)} images\n\n"
-                f"This will:\n"
-                f"• Detect scale for each image\n"
-                f"• Detect and save pinholes\n"
-                f"• Analyze grain sizes\n"
-                f"• Save all results automatically\n\n"
-                f"Continue with automated processing?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes
-            )
-        else:
-            # Manual processing
-            reply = QMessageBox.question(
-                self,
-                "Manual Batch Processing",
-                f"📋 Ready to process {len(self.image_list)} images with manual confirmation\n\n"
-                f"You will be prompted for each step:\n"
-                f"• Scale detection confirmation\n"
-                f"• Pinhole detection review\n"
-                f"• Grain analysis confirmation\n\n"
-                f"Continue with manual processing?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes
-            )
+        # Semi-automated processing - always automated, prompts only when needed
+        reply = QMessageBox.question(
+            self,
+            "Semi-Automated Batch Processing",
+            f"🤖 Ready to process {len(self.image_list)} images\n\n"
+            f"Semi-automated workflow:\n"
+            f"✅ Auto-detects Frame Width from SEM footer\n"
+            f"✅ Auto-detects and saves pinholes\n"
+            f"✅ Auto-analyzes grain sizes\n"
+            f"⚠️ Prompts you ONLY if Frame Width detection fails\n\n"
+            f"Continue with batch processing?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
         
         if reply == QMessageBox.Yes:
             self.start_batch_processing()
@@ -504,6 +561,7 @@ class MainWindow(QMainWindow):
         if not self.image_list:
             return
         
+        self.is_batch_processing = True  # Set batch processing flag
         self.current_batch_index = 0
         self.process_all_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
@@ -520,42 +578,93 @@ class MainWindow(QMainWindow):
         
         current_image = self.image_list[self.current_batch_index]
         self.current_image_path = current_image
+        
+        self.log_message(f"📸 Processing image {self.current_batch_index + 1}/{len(self.image_list)}: {os.path.basename(current_image)}")
+        self.log_message(f"🔧 is_batch_processing flag = {self.is_batch_processing}")
+        
+        # Set guard flag to prevent on_image_path_changed from triggering
+        self._updating_image_path = True
         self.image_path_edit.setText(current_image)
+        self._updating_image_path = False
         
         progress = ((self.current_batch_index + 1) / len(self.image_list)) * 100
         self.progress_bar.setValue(int(progress))
         
-        self.log_message(f"📸 Processing image {self.current_batch_index + 1}/{len(self.image_list)}: {os.path.basename(current_image)}")
-        
-        if self.automate_check.isChecked():
-            # Automated processing
-            self.process_image_automated()
-        else:
-            # Manual processing - load image and let user proceed manually
-            self.load_image_preview(current_image)
-            QMessageBox.information(
-                self,
-                "Manual Processing",
-                f"📸 Loaded image {self.current_batch_index + 1}/{len(self.image_list)}\n\n"
-                f"{os.path.basename(current_image)}\n\n"
-                f"Please process this image manually, then click 'Next Image' to continue."
-            )
+        # Always use semi-automated processing
+        self.log_message("🤖 Starting semi-automated processing...")
+        self.process_image_automated()
     
     def process_image_automated(self):
         """Process current image automatically (detect scale, pinholes, and grains)."""
         try:
-            # Step 1: Auto-detect scale
-            self.log_message("🔍 Step 1: Auto-detecting scale...")
-            self.auto_detect_scale_from_footer()
+            # Step 1: Auto-detect scale (SYNCHRONOUS in batch mode - no async delays)
+            self.log_message("=" * 60)
+            self.log_message(f"🔍 Step 1: Auto-detecting scale for: {os.path.basename(self.current_image_path)}")
             
-            # Check if we have a valid frame width
-            if self.frame_width_spinbox.value() <= 0:
-                self.log_message("❌ Could not auto-detect scale, skipping image")
-                self.current_batch_index += 1
-                QTimer.singleShot(1000, self.process_next_image)
-                return
+            # Call detection (it will reset Frame Width internally to avoid using stale values)
+            self.log_message("🔎 Running synchronous OCR detection...")
+            self.auto_detect_scale_from_footer_sync()
+            self.log_message(f"📊 Detection complete. Frame Width = {self.frame_width_spinbox.value()} μm")
             
-            # Step 2: Auto-detect pinholes
+            # Check if we have a valid frame width after detection
+            frame_width = self.frame_width_spinbox.value()
+            if frame_width <= 0 or frame_width < 0.1:
+                self.log_message(f"❌ Invalid Frame Width detected: {frame_width} μm")
+                self.log_message("⚠️ This image may not be a valid SEM image with proper footer")
+                self.log_message("⏸️ PROMPTING USER for manual Frame Width input...")
+                
+                # Prompt user for manual input
+                from PyQt5.QtWidgets import QInputDialog, QMessageBox
+                
+                # First show a clear explanation
+                image_name = os.path.basename(self.current_image_path)
+                reply = QMessageBox.question(
+                    self,
+                    "⚠️ Frame Width Detection Failed",
+                    f"❌ Could not auto-detect Frame Width for:\n\n"
+                    f"📁 {image_name}\n\n"
+                    f"This may NOT be a valid SEM image, or the footer is unreadable.\n\n"
+                    f"What would you like to do?\n\n"
+                    f"• Click 'Yes' to enter Frame Width manually (if you know it)\n"
+                    f"• Click 'No' to SKIP this image and continue",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No  # Default to No (skip)
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # User wants to enter manually
+                    user_value, ok = QInputDialog.getDouble(
+                        self,
+                        "Enter Frame Width Manually",
+                        f"Enter Frame Width for {image_name}:\n\n"
+                        f"(in micrometers, µm)",
+                        value=21.8,  # Default common value
+                        min=0.1,
+                        max=10000.0,
+                        decimals=2
+                    )
+                    
+                    if ok and user_value > 0.1:
+                        # User provided valid Frame Width
+                        self.frame_width_spinbox.setValue(user_value)
+                        self.log_message(f"✅ User provided Frame Width: {user_value} μm")
+                        frame_width = user_value
+                        # Continue processing with user-provided value
+                    else:
+                        # User cancelled - skip this image
+                        self.log_message("⏭️ User cancelled manual input - skipping image")
+                        self.current_batch_index += 1
+                        QTimer.singleShot(500, self.process_next_image)
+                        return
+                else:
+                    # User chose to skip this image
+                    self.log_message("⏭️ User chose to skip this image")
+                    self.current_batch_index += 1
+                    QTimer.singleShot(500, self.process_next_image)
+                    return
+            
+            # Step 2: Auto-detect pinholes (ONLY if we have valid frame width)
+            self.log_message(f"✅ Valid Frame Width detected: {frame_width} μm")
             self.log_message("🕳️ Step 2: Auto-detecting pinholes...")
             self.detect_pinholes_automated()
             
@@ -564,15 +673,24 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             self.log_message(f"❌ Error in automated processing: {str(e)}")
+            import traceback
+            traceback.print_exc()
             self.current_batch_index += 1
             QTimer.singleShot(1000, self.process_next_image)
     
     def detect_pinholes_automated(self):
         """Detect pinholes automatically without user interaction."""
         try:
+            # CRITICAL: Validate Frame Width before attempting detection
+            frame_width = self.frame_width_spinbox.value()
+            if frame_width <= 0 or frame_width < 0.1:
+                self.log_message(f"❌ Cannot detect pinholes: Invalid Frame Width ({frame_width} μm)")
+                self.log_message("⏭️ Skipping pinhole detection for this image")
+                return
+            
             results = self.pinhole_detector.detect_pinholes(
                 self.current_image_path,
-                self.frame_width_spinbox.value()
+                frame_width
             )
             
             if results['success']:
@@ -610,12 +728,21 @@ class MainWindow(QMainWindow):
     def analyze_grains_automated(self):
         """Analyze grains automatically without user interaction."""
         try:
+            # CRITICAL: Validate Frame Width before attempting grain analysis
+            frame_width = self.frame_width_spinbox.value()
+            if frame_width <= 0 or frame_width < 0.1:
+                self.log_message(f"❌ Cannot analyze grains: Invalid Frame Width ({frame_width} μm)")
+                self.log_message("⏭️ Skipping grain analysis for this image")
+                self.current_batch_index += 1
+                QTimer.singleShot(1000, self.process_next_image)
+                return
+            
             self.log_message("🔬 Step 3: Auto-analyzing grains...")
             
             # Prepare analysis parameters
             analysis_params = {
                 'image_path': self.current_image_path,
-                'frame_width_um': self.frame_width_spinbox.value(),
+                'frame_width_um': frame_width,
                 'min_area_px': self.min_area_spinbox.value(),
                 'apply_feret_cap': self.apply_cap_check.isChecked(),
                 'feret_cap_um': self.feret_cap_spinbox.value(),
@@ -656,6 +783,7 @@ class MainWindow(QMainWindow):
     
     def finish_batch_processing(self):
         """Finish batch processing and reset UI."""
+        self.is_batch_processing = False  # Clear batch processing flag
         self.process_all_button.setEnabled(True)
         self.analyze_button.setEnabled(True)
         self.progress_bar.setValue(0)
@@ -703,6 +831,69 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error loading image preview: {str(e)}")
             self.image_preview_label.setText("Error loading image")
     
+    def auto_detect_scale_from_footer_sync(self):
+        """Synchronous scale detection for batch processing (no dialogs, no async delays)."""
+        if not self.current_image_path or not os.path.exists(self.current_image_path):
+            self.log_message("❌ No image path - cannot detect scale")
+            self.frame_width_spinbox.setValue(0.0)
+            return
+        
+        # CRITICAL: Initialize to 0.0 to ensure we don't use stale/default values
+        self.frame_width_spinbox.setValue(0.0)
+        
+        try:
+            # Show progress cursor to indicate processing
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()  # Update UI
+            
+            # Use exact footer OCR
+            results = self.exact_ocr.analyze_sem_footer_exact(self.current_image_path)
+            
+            # Restore cursor
+            QApplication.restoreOverrideCursor()
+            
+            if 'error' in results:
+                self.log_message(f"❌ OCR Error: {results['error']}")
+                self.scale_status_label.setText("Status: ❌ Not a SEM image")
+                self.scale_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self.frame_width_spinbox.setValue(0.0)  # Explicitly set to 0
+                return
+            
+            metadata = results.get('metadata', {})
+            
+            if 'fw_um' in metadata:
+                frame_width = metadata['fw_um']
+                
+                # Validate frame width is reasonable
+                if frame_width <= 0 or frame_width > 10000:
+                    self.log_message(f"❌ Detected Frame Width {frame_width} μm seems invalid")
+                    self.frame_width_spinbox.setValue(0.0)
+                    return
+                
+                self.frame_width_spinbox.setValue(frame_width)
+                self.log_message(f"✅ Auto-detected Frame Width: {frame_width} μm")
+                self.scale_status_label.setText(f"Status: ✅ Detected {frame_width} μm")
+                self.scale_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+                
+                # Log additional info if available
+                if 'magnification' in metadata:
+                    self.log_message(f"🔍 Magnification: {metadata['magnification']:,}x")
+                if results.get('um_per_pixel'):
+                    self.log_message(f"📐 Pixel size: {results['um_per_pixel']:.8f} μm/pixel")
+            else:
+                self.log_message("❌ Could not detect Frame Width from footer")
+                self.scale_status_label.setText("Status: ❌ Detection failed")
+                self.scale_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self.frame_width_spinbox.setValue(0.0)
+                
+        except Exception as e:
+            # Restore cursor in case of error
+            QApplication.restoreOverrideCursor()
+            self.log_message(f"❌ Auto-detection error: {str(e)}")
+            self.scale_status_label.setText("Status: ❌ Error occurred")
+            self.scale_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            self.frame_width_spinbox.setValue(0.0)
+    
     def auto_detect_scale_from_footer(self):
         """Automatically detect scale from SEM footer using exact OCR."""
         if not self.current_image_path or not os.path.exists(self.current_image_path):
@@ -711,18 +902,51 @@ class MainWindow(QMainWindow):
         try:
             self.log_message("🔍 Auto-detecting scale from SEM footer...")
             
+            # Show progress cursor to indicate processing
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()  # Update UI
+            
             # Use exact footer OCR
             results = self.exact_ocr.analyze_sem_footer_exact(self.current_image_path)
             
+            # Restore cursor
+            QApplication.restoreOverrideCursor()
+            
             if 'error' in results:
                 self.log_message(f"❌ OCR Error: {results['error']}")
-                self.ask_user_for_manual_scale()
+                self.log_message("⚠️ This may not be a valid SEM image")
+                self.scale_status_label.setText("Status: ❌ Not a SEM image")
+                self.scale_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                # Reset frame width to 0 to indicate detection failure
+                self.frame_width_spinbox.setValue(0.0)
+                
+                # Automatically switch to manual input mode
+                self.prompt_manual_input_mode()
+                
+                # Show clear error message with improved guidance
+                QMessageBox.warning(
+                    self,
+                    "Not a SEM Image",
+                    f"⚠️ This does not appear to be a valid SEM image.\n\n"
+                    f"SEM images should have a footer with metadata including Frame Width (FW).\n\n"
+                    f"The interface has been switched to MANUAL input mode.\n"
+                    f"You can now enter the Frame Width in the highlighted field below.\n\n"
+                    f"If you don't know the scale, you may need to check the original image metadata."
+                )
                 return
             
             metadata = results.get('metadata', {})
             
             if 'fw_um' in metadata:
                 frame_width = metadata['fw_um']
+                
+                # Validate frame width is reasonable
+                if frame_width <= 0 or frame_width > 10000:  # Sanity check
+                    self.log_message(f"❌ Detected Frame Width {frame_width} μm seems invalid")
+                    self.frame_width_spinbox.setValue(0.0)
+                    self.ask_user_for_manual_scale()
+                    return
+                
                 self.frame_width_spinbox.setValue(frame_width)
                 self.log_message(f"✅ Auto-detected Frame Width: {frame_width} μm")
                 
@@ -751,38 +975,58 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.log_message("❌ Could not detect Frame Width from footer")
+                self.log_message("⚠️ This may not be a valid SEM image with proper footer")
                 self.scale_status_label.setText("Status: ❌ Detection failed")
                 self.scale_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                # Reset frame width to 0 to indicate detection failure
+                self.frame_width_spinbox.setValue(0.0)
                 self.ask_user_for_manual_scale()
                 
         except Exception as e:
+            # Restore cursor in case of error
+            QApplication.restoreOverrideCursor()
+            
             self.log_message(f"❌ Auto-detection error: {str(e)}")
+            self.log_message("⚠️ This may not be a valid SEM image")
             self.scale_status_label.setText("Status: ❌ Error occurred")
             self.scale_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
-            self.ask_user_for_manual_scale()
+            # Reset frame width to 0 to indicate detection failure
+            self.frame_width_spinbox.setValue(0.0)
+            
+            # Show error dialog
+            QMessageBox.critical(
+                self,
+                "Detection Error",
+                f"❌ Error during scale detection:\n{str(e)}\n\n"
+                f"This may not be a valid SEM image."
+            )
     
     def ask_user_for_manual_scale(self):
         """Ask user to provide manual scale information."""
         reply = QMessageBox.question(
             self, 
             "Manual Scale Input Required", 
-            "Automatic scale detection failed.\n\n"
+            "⚠️ Automatic scale detection failed.\n\n"
+            "This may not be a valid SEM image with a proper footer containing Frame Width information.\n\n"
             "Would you like to:\n"
-            "• Click 'Yes' to enter Frame Width manually\n"
-            "• Click 'No' to try OCR detection again",
-            QMessageBox.Yes | QMessageBox.No,
+            "• Click 'Yes' to enter Frame Width manually (if you know the scale)\n"
+            "• Click 'No' to try OCR detection again\n"
+            "• Click 'Cancel' to skip this image",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
             QMessageBox.Yes
         )
         
         if reply == QMessageBox.Yes:
-            # Enable manual input
-            self.auto_ocr_check.setChecked(False)
-            self.frame_width_spinbox.setEnabled(True)
+            # Switch to manual input mode with visual highlighting
+            self.prompt_manual_input_mode()
             self.frame_width_spinbox.setFocus()
-            self.log_message("📝 Please enter Frame Width manually")
-        else:
+            self.log_message("📝 Please enter Frame Width manually in the highlighted field")
+        elif reply == QMessageBox.No:
             # Try OCR again
             self.detect_scale()
+        else:
+            # Cancel - user wants to skip
+            self.log_message("⏭️ Skipping image - no valid scale information")
     
     def detect_scale(self):
         """Detect scale information from the image using exact footer OCR."""
@@ -1091,30 +1335,6 @@ class MainWindow(QMainWindow):
         self.log_tab.append(f"[{current_time}] {message}")
         self.log_tab.ensureCursorVisible()
     
-    def auto_detect_scale_from_footer(self):
-        """Auto-detect scale from image footer."""
-        if not self.current_image_path:
-            return
-        
-        try:
-            from ..core.exact_footer_ocr import ExactFooterOCR
-            ocr = ExactFooterOCR()
-            frame_width = ocr.extract_frame_width(self.current_image_path)
-            
-            if frame_width:
-                self.frame_width_spinbox.setValue(frame_width)
-                self.scale_status_label.setText(f"✅ Detected: {frame_width} μm")
-                self.scale_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-                self.log_message(f"🎯 Auto-detected scale: {frame_width} μm")
-            else:
-                self.scale_status_label.setText("❌ Auto-detection failed")
-                self.scale_status_label.setStyleSheet("color: #f44336; font-weight: bold;")
-                self.log_message("⚠️ Could not auto-detect scale from footer")
-        except Exception as e:
-            self.scale_status_label.setText("❌ Detection error")
-            self.scale_status_label.setStyleSheet("color: #f44336; font-weight: bold;")
-            self.log_message(f"❌ Scale detection error: {str(e)}")
-
     def load_image_preview(self, image_path):
         """Load image preview without full processing."""
         try:
@@ -1122,52 +1342,11 @@ class MainWindow(QMainWindow):
             # Update UI with current image
             self.image_path_edit.setText(image_path)
             
-            # If auto-OCR is enabled, try to detect scale
-            if self.auto_ocr_check.isChecked():
-                self.auto_detect_scale_from_footer()
+            # Note: Auto-OCR detection is handled in on_image_path_changed()
+            # Don't call it here to avoid duplicate detection
                 
         except Exception as e:
             self.log_message(f"❌ Error loading image preview: {str(e)}")
-
-    def detect_pinholes(self):
-        """Detect pinholes in the current image."""
-        if not self.current_image_path:
-            QMessageBox.warning(self, "Warning", "Please select an image first.")
-            return
-        
-        if not self.frame_width_spinbox.value():
-            QMessageBox.warning(self, "Warning", "Please set the frame width first.")
-            return
-        
-        try:
-            self.log_message("🕳️ Starting pinhole detection...")
-            
-            # Show progress
-            progress = QProgressDialog("Detecting pinholes...", None, 0, 0, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            QApplication.processEvents()
-            
-            # Detect pinholes
-            results = self.pinhole_detector.detect_pinholes(
-                self.current_image_path,
-                self.frame_width_spinbox.value()
-            )
-            
-            progress.close()
-            
-            if results['success']:
-                self.pinhole_results = results
-                self.show_pinhole_preview_dialog(results)
-            else:
-                QMessageBox.warning(self, "Detection Failed", 
-                                  f"Pinhole detection failed:\n{results['message']}")
-                
-        except Exception as e:
-            if 'progress' in locals():
-                progress.close()
-            QMessageBox.critical(self, "Error", f"Error during pinhole detection:\n{str(e)}")
-            self.log_message(f"❌ Pinhole detection error: {str(e)}")
     
     def show_pinhole_preview_dialog(self, results):
         """Show pinhole detection preview dialog with results parameter."""

@@ -8,6 +8,21 @@ import os
 import logging
 from pathlib import Path
 
+# Fix for PyInstaller NumPy/typing circular import issues
+if hasattr(sys, '_MEIPASS'):
+    # We're running in a PyInstaller bundle
+    # Import typing modules first to prevent circular imports
+    try:
+        import typing
+        import types
+        import collections.abc
+        # Now import NumPy safely
+        import numpy
+        # Force NumPy to initialize properly
+        numpy.seterr(all='ignore')
+    except ImportError as e:
+        print(f"Warning: Import issue during initialization: {e}")
+
 # Add the src directory to Python path so we can import our modules
 src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src')
 if src_dir not in sys.path:

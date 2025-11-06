@@ -38,8 +38,13 @@ pytest>=7.0.0
 black>=22.0.0
 flake8>=4.0.0
 
-# For building executable (optional)
-pyinstaller>=5.0.0
+# For building executable (required for distribution)
+pyinstaller>=5.13.0
+# Additional build dependencies
+setuptools>=65.0.0
+wheel>=0.38.0
+# Windows-specific dependencies for standalone exe
+pywin32>=305; sys_platform == "win32"
 
 # Note: For tesseract OCR, you also need to install Tesseract-OCR separately:
 # Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
