@@ -1,0 +1,1114 @@
+"""
+Experimental Grain Analysis Script with UI
+===========================================
+This script tests different STRONG CLAHE image processing techniques for grain detection
+without modifying the main GrainSizeCalculator application.
+
+Features:
+- Multiple STRONG contrast enhancement methods (CLAHE 3.0, 5.0, 8.0+)
+- Sato ridge detection for grain boundaries
+- SAM-B segmentation with ridge-based filtering
+- GUI for image selection and parameter adjustment
+- Saves all ridge responses for analysis
+"""
+
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from pathlib import Path
+import logging
+import sys
+from datetime import datetime
+
+from skimage.restoration import denoise_tv_chambolle
+from skimage.filters import sato
+from skimage.morphology import skeletonize, remove_small_objects, erosion, dilation, disk
+from skimage.measure import regionprops
+
+from ultralytics import SAM
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QGroupBox, QSlider, QSpinBox,
+    QProgressBar, QTextEdit, QDoubleSpinBox, QFormLayout, QComboBox
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont
+
+# ========= OPTIMIZED 6-PROFILE TESTING =========
+# Reduced to 6 best-performing combinations for speed and clarity
+PRESET_PROFILES = {
+    "Balanced_Default": {
+        "clip1": 4.0, "clip2": 7.0, "clip3": 12.0,
+        "tv_weight": 0.08, "ridge_percentile": 70, "min_size": 9, "ridge_threshold": 0.20,
+        "variants": ["clahe_strong_8x8"],  # Best baseline - medium tiles
+        "description": "Conservative baseline with medium tiles"
+    },
+    "Low_Contrast_Images": {
+        "clip1": 8.0, "clip2": 14.0, "clip3": 22.0,
+        "tv_weight": 0.06, "ridge_percentile": 65, "min_size": 8, "ridge_threshold": 0.15,
+        "variants": ["clahe_strong_4x4", "clahe_vstrong_4x4"],  # Low + very strong contrast
+        "description": "For subtle boundaries - small tiles + very strong"
+    },
+    "Aggressive_High_Detection": {
+        "clip1": 8.0, "clip2": 15.0, "clip3": 20.0,
+        "tv_weight": 0.05, "ridge_percentile": 60, "min_size": 5, "ridge_threshold": 0.12,
+        "variants": ["clahe_vstrong_8x8", "clahe_ultra_8x8"],  # Very strong + ultra
+        "description": "High detection - medium tiles"
+    },
+    "Ultra_Aggressive": {
+        "clip1": 12.0, "clip2": 20.0, "clip3": 30.0,
+        "tv_weight": 0.04, "ridge_percentile": 55, "min_size": 3, "ridge_threshold": 0.10,
+        "variants": ["clahe_ultra_4x4"],  # Maximum detection - small tiles only
+        "description": "Extreme settings for maximum grain detection"
+    }
+}
+
+# SAM Model Selection - Only test SAM-B for now
+MODELS_TO_TEST = ["sam_b.pt"]  # SAM-B for precision (no grain merging)
+
+# Dynamic Auto-Selection - Pick best profile automatically
+ENABLE_AUTO_SELECTION = True  # Test all and auto-select best
+MIN_GRAINS_FOR_SUCCESS = 20  # Minimum grains to consider successful
+STOP_ON_EXCELLENT_RESULT = True  # Stop early if excellent result found
+EXCELLENT_GRAIN_COUNT = 100  # Stop if profile finds this many quality grains
+
+# Image Tiling Configuration - Process large images as tiles for better detection
+ENABLE_TILING = True  # Set to True to enable automatic tiling for large images
+TILE_SIZE = 1024  # Size of each tile in pixels (larger tiles = more context, smaller = more detail)
+TILE_OVERLAP = 128  # Overlap between tiles to avoid edge artifacts
+MIN_IMAGE_SIZE_FOR_TILING = 2048  # Only tile images larger than this
+# ===================================
+
+# ========= OUTPUT DIRECTORY FOR RIDGE RESPONSES =========
+OUTPUT_DIR = Path("experimental_outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+# ========================================================
+
+
+class AnalysisWorker(QThread):
+    """Background thread for running grain analysis"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, img_path, all_profiles=True):
+        super().__init__()
+        self.img_path = img_path
+        self.all_profiles = all_profiles
+
+    def run(self):
+        try:
+            self.analyze_image()
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def analyze_image(self):
+        """Main analysis pipeline - runs all profiles automatically"""
+        self.progress.emit(f"Loading image: {self.img_path.name}")
+        
+        # Load and preprocess
+        gray8 = self.load_and_preprocess_image(self.img_path)
+        h, w = gray8.shape
+        self.progress.emit(f"Image loaded: {w}x{h} pixels, dtype: {gray8.dtype}")
+        
+        # Check if tiling should be used
+        use_tiling = self.should_tile_image(gray8)
+        max_dim = max(h, w)
+        self.progress.emit(f">> Image size check: {max_dim} px (threshold: {MIN_IMAGE_SIZE_FOR_TILING} px)")
+        
+        if use_tiling:
+            tiles, tile_positions = self.create_tiles(gray8)
+            self.progress.emit(f">> ✅ TILING ENABLED: Image is LARGE, splitting into {len(tiles)} tiles")
+            self.progress.emit(f">> Each tile: {TILE_SIZE}x{TILE_SIZE} px with {TILE_OVERLAP} px overlap")
+            self.progress.emit(f">> This gives zoom-level detection quality across the whole image!")
+        else:
+            self.progress.emit(f">> ✅ TILING DISABLED: Image is small/medium, processing directly")
+            self.progress.emit(f">> Direct processing should work well at this resolution")
+
+        # Process each profile
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = self.img_path.stem
+        
+        # Store results for final comparison across ALL profiles and models
+        all_profile_results = []
+        
+        # Get list of profiles to test
+        profiles_to_test = list(PRESET_PROFILES.keys())
+        total_combinations = sum(len(PRESET_PROFILES[p]['variants']) for p in profiles_to_test)
+        
+        logging.getLogger('ultralytics').setLevel(logging.CRITICAL)
+        
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        self.progress.emit(f"\n{'='*70}")
+        self.progress.emit(f"🔬 TESTING {len(profiles_to_test)} PROFILES with {len(MODELS_TO_TEST)} SAM MODELS")
+        self.progress.emit(f"📊 Total combinations: {total_combinations} profiles × {len(MODELS_TO_TEST)} models")
+        self.progress.emit(f"🎯 Models: {', '.join(MODELS_TO_TEST)}")
+        self.progress.emit(f"💻 Device: {device.upper()}")
+        self.progress.emit(f"{'='*70}\n")
+        
+        # Test each SAM model
+        for model_name in MODELS_TO_TEST:
+            self.progress.emit(f"\n{'='*70}")
+            self.progress.emit(f"🤖 INITIALIZING MODEL: {model_name}")
+            model_type = "SAM-B (High Precision)" if "sam_b" in model_name else "SAM-L (High Recall)"
+            self.progress.emit(f"   Type: {model_type}")
+            self.progress.emit(f"{'='*70}\n")
+            
+            sam_model = SAM(model_name)
+            
+            for profile_name in profiles_to_test:
+                profile = PRESET_PROFILES[profile_name]
+                
+                self.progress.emit(f"\n{'='*60}")
+                self.progress.emit(f"🎯 MODEL: {model_name} | PROFILE: {profile_name}")
+                self.progress.emit(f"📝 {profile['description']}")
+                self.progress.emit(f"{'='*60}")
+                
+                # Only test the specific variants for this profile
+                variants_to_test = profile['variants']
+                
+                # Store results for this profile
+                profile_results = []
+
+                for variant_name in variants_to_test:
+                    # Generate the specific CLAHE variant
+                    self.progress.emit(f"\n  → Processing variant: {variant_name}")
+                    
+                    if variant_name == "clahe_strong_4x4":
+                        clahe = cv2.createCLAHE(clipLimit=profile['clip1'], tileGridSize=(4, 4)).apply(gray8)
+                    elif variant_name == "clahe_strong_8x8":
+                        clahe = cv2.createCLAHE(clipLimit=profile['clip1'], tileGridSize=(8, 8)).apply(gray8)
+                    elif variant_name == "clahe_vstrong_4x4":
+                        clahe = cv2.createCLAHE(clipLimit=profile['clip2'], tileGridSize=(4, 4)).apply(gray8)
+                    elif variant_name == "clahe_vstrong_8x8":
+                        clahe = cv2.createCLAHE(clipLimit=profile['clip2'], tileGridSize=(8, 8)).apply(gray8)
+                    elif variant_name == "clahe_ultra_4x4":
+                        clahe = cv2.createCLAHE(clipLimit=profile['clip3'], tileGridSize=(4, 4)).apply(gray8)
+                    elif variant_name == "clahe_ultra_8x8":
+                        clahe = cv2.createCLAHE(clipLimit=profile['clip3'], tileGridSize=(8, 8)).apply(gray8)
+                    else:
+                        continue
+                    
+                    imv = clahe.astype(np.float32) / 255.0
+
+                    # Sato ridge detection
+                    self.progress.emit(f"     Computing Sato ridge detection...")
+                    ridge_skel, ridge = self.edges_from_variant(
+                        imv,
+                        profile['tv_weight'],
+                        profile['ridge_percentile'],
+                        profile['min_size']
+                    )
+
+                    # Save ridge response for analysis
+                    model_short = "SAM-B" if "sam_b" in model_name else "SAM-L"
+                    safe_profile_name = profile_name.replace(" ", "_").replace("(", "").replace(")", "")
+                    ridge_path = OUTPUT_DIR / f"{base_name}_{model_short}_{safe_profile_name}_{variant_name}_{timestamp}_ridge.png"
+                    ridge_normalized = (ridge - ridge.min()) / (ridge.max() - ridge.min() + 1e-8)
+                    cv2.imwrite(str(ridge_path), (ridge_normalized * 255).astype(np.uint8))
+
+                    # Save skeleton
+                    skel_path = OUTPUT_DIR / f"{base_name}_{model_short}_{safe_profile_name}_{variant_name}_{timestamp}_skeleton.png"
+                    skel_img = np.where(ridge_skel, 0, 255).astype(np.uint8)
+                    cv2.imwrite(str(skel_path), skel_img)
+
+                    # Prepare for SAM
+                    var_u8 = np.clip(imv * 255.0, 0, 255).astype(np.uint8)
+                    
+                    # Check if we should process as tiles
+                    if use_tiling:
+                        self.progress.emit(f"     🔍 TILED PROCESSING: {len(tiles)} tiles with {model_short}...")
+                        
+                        # Process each tile
+                        all_masks = []
+                        for tile_idx, (tile, (y1, y2, x1, x2)) in enumerate(zip(tiles, tile_positions)):
+                            self.progress.emit(f"       Tile {tile_idx+1}/{len(tiles)}: position ({y1}:{y2}, {x1}:{x2})")
+                            # Apply same preprocessing to tile
+                            if variant_name == "clahe_strong_4x4":
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip1'], tileGridSize=(4, 4)).apply(tile)
+                            elif variant_name == "clahe_strong_8x8":
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip1'], tileGridSize=(8, 8)).apply(tile)
+                            elif variant_name == "clahe_vstrong_4x4":
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip2'], tileGridSize=(4, 4)).apply(tile)
+                            elif variant_name == "clahe_vstrong_8x8":
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip2'], tileGridSize=(8, 8)).apply(tile)
+                            elif variant_name == "clahe_ultra_4x4":
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip3'], tileGridSize=(4, 4)).apply(tile)
+                            elif variant_name == "clahe_ultra_8x8":
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip3'], tileGridSize=(8, 8)).apply(tile)
+                            else:
+                                # Default fallback
+                                tile_clahe = cv2.createCLAHE(clipLimit=profile['clip1'], tileGridSize=(4, 4)).apply(tile)
+                            
+                            tile_var_u8 = tile_clahe
+                            tile_rgb = np.dstack([tile_var_u8, tile_var_u8, tile_var_u8])
+                            tile_rgb = np.ascontiguousarray(tile_rgb)
+                            
+                            # Run SAM on tile
+                            tile_results = sam_model.predict(tile_rgb, verbose=False, device=device)
+                            tile_res0 = tile_results[0]
+                            
+                            tile_mobj = getattr(tile_res0, "masks", None)
+                            if tile_mobj is not None and getattr(tile_mobj, "data", None) is not None:
+                                try:
+                                    tile_masks = tile_mobj.data.detach().cpu().numpy()
+                                except:
+                                    tile_masks = tile_mobj.data.cpu().numpy()
+                                
+                                # Offset masks to full image coordinates
+                                if tile_masks.ndim == 3:
+                                    for mask in tile_masks:
+                                        # Crop to actual tile size (remove padding)
+                                        actual_h = y2 - y1
+                                        actual_w = x2 - x1
+                                        mask_cropped = mask[:actual_h, :actual_w]
+                                        
+                                        # Create full-size mask
+                                        full_mask = np.zeros((gray8.shape[0], gray8.shape[1]), dtype=mask.dtype)
+                                        full_mask[y1:y2, x1:x2] = mask_cropped
+                                        all_masks.append(full_mask)
+                        
+                        # Combine all tile masks
+                        if all_masks:
+                            m_np = np.array(all_masks)
+                            num_masks_raw = len(all_masks)
+                        else:
+                            m_np = None
+                            num_masks_raw = 0
+                        
+                        masks_per_tile = num_masks_raw / len(tiles) if len(tiles) > 0 else 0
+                        self.progress.emit(f"     ✓ Collected {num_masks_raw} masks from {len(tiles)} tiles (avg {masks_per_tile:.1f}/tile)")
+                        
+                    else:
+                        # Process full image (original behavior)
+                        rgb_for_sam = np.dstack([var_u8, var_u8, var_u8])
+                        rgb_for_sam = np.ascontiguousarray(rgb_for_sam)
+                        
+                        self.progress.emit(f"     🔍 FULL IMAGE PROCESSING: SAM-B on {device.upper()}...")
+                        results = sam_model.predict(rgb_for_sam, verbose=False, device=device)
+                        res0 = results[0]
+                        
+                        mobj = getattr(res0, "masks", None)
+                        if mobj is not None and getattr(mobj, "data", None) is not None:
+                            try:
+                                m_np = mobj.data.detach().cpu().numpy()
+                            except Exception:
+                                m_np = mobj.data.cpu().numpy()
+                            
+                            if m_np.ndim == 3:
+                                num_masks_raw = m_np.shape[0]
+                            else:
+                                m_np = None
+                                num_masks_raw = 0
+                        else:
+                            m_np = None
+                            num_masks_raw = 0
+
+                    # Create a mock object for quality metrics calculation
+                    if m_np is not None:
+                        # Convert to numpy if it's a tensor
+                        if hasattr(m_np, 'cpu'):
+                            m_np = m_np.cpu().numpy()
+                        elif hasattr(m_np, 'detach'):
+                            m_np = m_np.detach().cpu().numpy()
+                        
+                        # DEDUPLICATE overlapping masks from tiling
+                        if use_tiling and m_np.shape[0] > 0:
+                            self.progress.emit(f"     Deduplicating {m_np.shape[0]} masks from tile overlaps...")
+                            m_np = self.deduplicate_masks(m_np)
+                            self.progress.emit(f"     ✓ After deduplication: {m_np.shape[0]} unique masks")
+                        
+                        class MockMasks:
+                            def __init__(self, data):
+                                self.data = data
+                        
+                        mobj = MockMasks(m_np)
+                        num_masks_raw = m_np.shape[0]  # Update count after deduplication
+                    else:
+                        mobj = None
+
+                    # Ridge-based filtering
+                    ridge_normalized = (ridge - ridge.min()) / (ridge.max() - ridge.min() + 1e-8)
+                    self.progress.emit(f"     Filtering {num_masks_raw} masks...")
+                    
+                    masks_overlay, num_masks_kept = self.color_sam_masks_by_ridge(
+                        cv2.cvtColor(var_u8, cv2.COLOR_GRAY2RGB),
+                        ridge_normalized,
+                        m_np,
+                        profile['ridge_threshold']
+                    )
+                    
+                    # Count unique grains by unique colors in this profile
+                    unique_colors_profile = set()
+                    for y in range(masks_overlay.shape[0]):
+                        for x in range(masks_overlay.shape[1]):
+                            r, g, b = masks_overlay[y, x]
+                            # Skip grayscale pixels (R=G=B)
+                            if r != g or g != b:
+                                unique_colors_profile.add((int(r), int(g), int(b)))
+                    num_unique_grains_profile = len(unique_colors_profile)
+                    
+                    self.progress.emit(f"     ✓ Masks: {num_masks_raw} raw → {num_masks_kept} kept → {num_unique_grains_profile} unique grains")
+                    
+                    # Calculate quality metrics for analysis
+                    quality_metrics = self.calculate_grain_quality_metrics(mobj, ridge_normalized if num_masks_kept > 0 else None)
+                    
+                    # Log quality metrics
+                    self.progress.emit(f"     📊 Precision Score: {quality_metrics['precision_score']:.1f}/100 | "
+                                     f"Circ: {quality_metrics['avg_circularity']:.3f} | "
+                                     f"Solid: {quality_metrics['avg_solidity']:.3f}")
+                    
+                    # Save final overlay with grain count in filename
+                    overlay_path = OUTPUT_DIR / f"{base_name}_{model_short}_{safe_profile_name}_{variant_name}_{timestamp}_{num_unique_grains_profile}_GRAINS_overlay.png"
+                    cv2.imwrite(str(overlay_path), cv2.cvtColor(masks_overlay, cv2.COLOR_RGB2BGR))
+
+                    # Save metrics to text file
+                    metrics_path = OUTPUT_DIR / f"{base_name}_{model_short}_{safe_profile_name}_{variant_name}_{timestamp}_METRICS.txt"
+                    with open(metrics_path, 'w') as f:
+                        f.write(f"Grain Detection Quality Metrics\n")
+                        f.write(f"================================\n")
+                        f.write(f"SAM Model: {model_name} ({model_type})\n")
+                        f.write(f"Profile: {profile_name}\n")
+                        f.write(f"Variant: {variant_name}\n")
+                        f.write(f"Timestamp: {timestamp}\n\n")
+                        f.write(f"Detection Results:\n")
+                        f.write(f"  Raw SAM masks: {num_masks_raw}\n")
+                        f.write(f"  Ridge-filtered masks: {num_masks_kept}\n\n")
+                        f.write(f"Quality Metrics:\n")
+                        f.write(f"  Avg Circularity: {quality_metrics['avg_circularity']:.3f}\n")
+                        f.write(f"  Avg Solidity: {quality_metrics['avg_solidity']:.3f}\n")
+                        f.write(f"  Boundary Ridge Score: {quality_metrics['avg_boundary_ridge']:.3f}\n")
+                        f.write(f"  Size Consistency (CV): {quality_metrics['size_cv']:.3f}\n")
+                        f.write(f"  PRECISION SCORE: {quality_metrics['precision_score']:.2f}/100\n")
+
+                    # Create visualization
+                    self.create_visualization(imv, ridge, skel_img, masks_overlay, f"{model_short}_{safe_profile_name}_{variant_name}", 
+                                            num_masks_raw, num_masks_kept, base_name, timestamp, quality_metrics)
+                    
+                    # Store results with masks for union creation
+                    profile_results.append({
+                        'model': model_name,
+                        'profile': profile_name,
+                        'variant': variant_name,
+                        'raw_masks': num_masks_raw,
+                        'kept_masks': num_masks_kept,
+                        'metrics': quality_metrics,
+                        'overlay': masks_overlay  # Save overlay for union
+                    })
+                
+                # Add all variants of this profile to global results
+                all_profile_results.extend(profile_results)
+        
+        # Create final comparison report across ALL profiles, models, and variants
+        self.create_comparison_report(all_profile_results, base_name, timestamp)
+        
+        # Create UNION image - all grains detected by ANY profile
+        self.progress.emit(f"\n{'='*60}")
+        self.progress.emit("🎨 Creating UNION image - combining ALL detected grains...")
+        self.create_union_image(all_profile_results, gray8, base_name, timestamp)
+        self.progress.emit(f"{'='*60}")
+
+        self.progress.emit(f"\n{'='*50}")
+        self.progress.emit("✅ Analysis complete!")
+        self.progress.emit(f"All outputs saved to: {OUTPUT_DIR.absolute()}")
+        self.progress.emit(f"{'='*50}")
+
+    def load_and_preprocess_image(self, img_path):
+        """Load and convert image to 8-bit grayscale"""
+        img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise RuntimeError(f"Could not read {img_path}")
+
+        if img.ndim == 3:
+            if img.shape[2] == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            elif img.shape[2] == 4:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+            else:
+                gray = img.mean(axis=2).astype(img.dtype)
+        else:
+            gray = img
+
+        gray8 = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return gray8
+
+    def should_tile_image(self, gray8):
+        """Check if image should be tiled based on size"""
+        if not ENABLE_TILING:
+            return False
+        h, w = gray8.shape
+        return max(h, w) > MIN_IMAGE_SIZE_FOR_TILING
+
+    def create_tiles(self, gray8):
+        """Split image into overlapping tiles for better grain detection"""
+        h, w = gray8.shape
+        tiles = []
+        tile_positions = []
+        
+        stride = TILE_SIZE - TILE_OVERLAP
+        
+        for y in range(0, h, stride):
+            for x in range(0, w, stride):
+                # Calculate tile boundaries
+                y1 = y
+                y2 = min(y + TILE_SIZE, h)
+                x1 = x
+                x2 = min(x + TILE_SIZE, w)
+                
+                # Extract tile
+                tile = gray8[y1:y2, x1:x2]
+                
+                # Pad tile if it's smaller than TILE_SIZE (edge tiles)
+                if tile.shape[0] < TILE_SIZE or tile.shape[1] < TILE_SIZE:
+                    padded = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+                    padded[:tile.shape[0], :tile.shape[1]] = tile
+                    tile = padded
+                
+                tiles.append(tile)
+                tile_positions.append((y1, y2, x1, x2))
+        
+        return tiles, tile_positions
+
+    def deduplicate_masks(self, masks):
+        """Remove duplicate/overlapping masks from tiling"""
+        if masks.shape[0] == 0:
+            return masks
+        
+        # Calculate IoU (Intersection over Union) for all pairs
+        unique_masks = []
+        used = set()
+        
+        for i in range(masks.shape[0]):
+            if i in used:
+                continue
+            
+            mask_i = masks[i] > 0.5
+            if not mask_i.any():
+                continue
+            
+            # Keep this mask
+            unique_masks.append(masks[i])
+            used.add(i)
+            
+            # Find and mark duplicates
+            for j in range(i + 1, masks.shape[0]):
+                if j in used:
+                    continue
+                
+                mask_j = masks[j] > 0.5
+                if not mask_j.any():
+                    continue
+                
+                # Calculate IoU
+                intersection = np.logical_and(mask_i, mask_j).sum()
+                union = np.logical_or(mask_i, mask_j).sum()
+                
+                if union > 0:
+                    iou = intersection / union
+                    # If IoU > 60%, consider it a duplicate
+                    if iou > 0.6:
+                        used.add(j)
+        
+        if len(unique_masks) > 0:
+            return np.array(unique_masks)
+        else:
+            return np.array([]).reshape(0, masks.shape[1], masks.shape[2])
+
+    def make_contrast_variants(self, gray8, clip1, clip2, clip3):
+        """Create multiple STRONG CLAHE variants with different tile sizes"""
+        variants = {}
+
+        # Strong with small tiles (better for fine details)
+        clahe_strong_small = cv2.createCLAHE(clipLimit=clip1, tileGridSize=(4, 4)).apply(gray8)
+        variants["clahe_strong_4x4"] = clahe_strong_small.astype(np.float32) / 255.0
+
+        # Strong with medium tiles
+        clahe_strong = cv2.createCLAHE(clipLimit=clip1, tileGridSize=(8, 8)).apply(gray8)
+        variants["clahe_strong_8x8"] = clahe_strong.astype(np.float32) / 255.0
+
+        # Very strong with small tiles
+        clahe_very_strong_small = cv2.createCLAHE(clipLimit=clip2, tileGridSize=(4, 4)).apply(gray8)
+        variants["clahe_vstrong_4x4"] = clahe_very_strong_small.astype(np.float32) / 255.0
+
+        # Very strong with medium tiles
+        clahe_very_strong = cv2.createCLAHE(clipLimit=clip2, tileGridSize=(8, 8)).apply(gray8)
+        variants["clahe_vstrong_8x8"] = clahe_very_strong.astype(np.float32) / 255.0
+
+        # Ultra strong with small tiles
+        clahe_ultra_strong_small = cv2.createCLAHE(clipLimit=clip3, tileGridSize=(4, 4)).apply(gray8)
+        variants["clahe_ultra_4x4"] = clahe_ultra_strong_small.astype(np.float32) / 255.0
+
+        # Ultra strong with medium tiles
+        clahe_ultra_strong = cv2.createCLAHE(clipLimit=clip3, tileGridSize=(8, 8)).apply(gray8)
+        variants["clahe_ultra_8x8"] = clahe_ultra_strong.astype(np.float32) / 255.0
+
+        return variants
+
+    def edges_from_variant(self, im_float01, tv_weight, ridge_percentile, min_size):
+        """Sato ridge detection pipeline - AUTO-DETECTS bright or dark grain boundaries"""
+        # TV denoising
+        dn = denoise_tv_chambolle(im_float01, weight=tv_weight)
+
+        # AUTO-DETECT: Are grain boundaries dark or bright?
+        # Strategy: Try BOTH modes and pick the one with stronger ridge response
+        ridge_dark = sato(dn, sigmas=range(1, 5), black_ridges=True)  # Dark boundaries
+        ridge_bright = sato(dn, sigmas=range(1, 5), black_ridges=False)  # Bright boundaries (inverted)
+        
+        # Compare which mode gives stronger ridge detection
+        dark_strength = np.mean(ridge_dark[ridge_dark > np.percentile(ridge_dark, 70)])
+        bright_strength = np.mean(ridge_bright[ridge_bright > np.percentile(ridge_bright, 70)])
+        
+        # Use the mode with stronger response
+        if bright_strength > dark_strength:
+            ridge = ridge_bright
+            mode_used = "bright boundaries (inverted mode)"
+        else:
+            ridge = ridge_dark
+            mode_used = "dark boundaries (normal mode)"
+
+        # Threshold
+        thr = np.percentile(ridge, ridge_percentile)
+        ridge_bin = ridge > thr
+
+        # Clean up
+        ridge_bin = remove_small_objects(ridge_bin, min_size=min_size)
+        ridge_skel = skeletonize(ridge_bin)
+
+        return ridge_skel, ridge
+
+    def color_sam_masks_by_ridge(self, rgb_base, ridge, m_np, ridge_weight_threshold):
+        """Filter and color SAM masks based on ridge response"""
+        overlay = rgb_base.copy().astype(np.float32)
+
+        # Normalize ridge
+        r_min, r_max = float(ridge.min()), float(ridge.max())
+        if r_max > r_min:
+            ridge_norm = (ridge - r_min) / (r_max - r_min)
+        else:
+            ridge_norm = np.zeros_like(ridge, dtype=np.float32)
+
+        kernel = np.ones((3, 3), np.uint8)
+        rng = np.random.default_rng(42)
+        accepted = 0
+        
+        # Track which pixels have been colored to avoid overwriting
+        colored_mask = np.zeros(rgb_base.shape[:2], dtype=bool)
+
+        for i in range(m_np.shape[0]):
+            m_bool = m_np[i] > 0.5
+
+            if not m_bool.any():
+                continue
+
+            # Get boundary
+            mask_u8 = (m_bool.astype(np.uint8) * 255)
+            eroded = cv2.erode(mask_u8, kernel, iterations=1)
+            boundary = (mask_u8 ^ eroded).astype(bool)
+
+            if not boundary.any():
+                continue
+
+            mean_ridge = ridge_norm[boundary].mean()
+
+            if mean_ridge < ridge_weight_threshold:
+                continue
+
+            accepted += 1
+            color = rng.integers(low=80, high=255, size=3, dtype=np.uint8)
+            
+            # Only color pixels that haven't been colored yet (avoid overwriting)
+            new_pixels = m_bool & ~colored_mask
+            if new_pixels.any():
+                overlay[new_pixels, 0] = color[0]
+                overlay[new_pixels, 1] = color[1]
+                overlay[new_pixels, 2] = color[2]
+                colored_mask |= new_pixels
+
+        return overlay.astype(np.uint8), accepted
+
+    def calculate_grain_quality_metrics(self, mobj, ridge_norm):
+        """
+        Calculate metrics to determine if grains are properly separated (not merged)
+        
+        Returns dict with:
+        - avg_circularity: How round the grains are (1.0 = perfect circle, <0.6 = might be merged)
+        - avg_solidity: How "filled" grains are (1.0 = no holes, <0.9 = irregular/merged)
+        - avg_boundary_ridge: How well boundaries align with ridges (higher = better separation)
+        - size_cv: Coefficient of variation of sizes (lower = more consistent)
+        - precision_score: Overall score 0-100 (higher = better precision)
+        - num_grains: Count of grains analyzed
+        """
+        
+        if mobj is None or not hasattr(mobj, 'data') or mobj.data is None:
+            return {
+                'avg_circularity': 0.0,
+                'avg_solidity': 0.0,
+                'avg_boundary_ridge': 0.0,
+                'size_cv': 0.0,
+                'precision_score': 0.0,
+                'num_grains': 0
+            }
+        
+        # Handle both tensor and numpy array inputs
+        if isinstance(mobj.data, np.ndarray):
+            m_np = mobj.data
+        else:
+            try:
+                m_np = mobj.data.detach().cpu().numpy()
+            except:
+                m_np = mobj.data.cpu().numpy()
+        
+        if m_np.ndim != 3 or m_np.shape[0] == 0:
+            return {
+                'avg_circularity': 0.0,
+                'avg_solidity': 0.0,
+                'avg_boundary_ridge': 0.0,
+                'size_cv': 0.0,
+                'precision_score': 0.0,
+                'num_grains': 0
+            }
+        
+        circularities = []
+        solidities = []
+        boundary_ridges = []
+        areas = []
+        
+        kernel = np.ones((3, 3), np.uint8)
+        
+        for i in range(m_np.shape[0]):
+            m_bool = m_np[i] > 0.5
+            
+            if not m_bool.any():
+                continue
+            
+            # Calculate shape metrics using regionprops
+            labeled = m_bool.astype(np.uint8)
+            props = regionprops(labeled)
+            
+            if len(props) > 0:
+                prop = props[0]
+                
+                # Circularity: 4π*Area/Perimeter² (1.0 = perfect circle, lower = elongated/irregular)
+                if prop.perimeter > 0:
+                    circularity = (4 * np.pi * prop.area) / (prop.perimeter ** 2)
+                    circularities.append(min(circularity, 1.0))
+                
+                # Solidity: Area/ConvexArea (1.0 = no concavities, lower = merged grains create dips)
+                solidities.append(prop.solidity)
+                
+                areas.append(prop.area)
+            
+            # Boundary ridge alignment (if ridge data available)
+            if ridge_norm is not None:
+                mask_u8 = (m_bool.astype(np.uint8) * 255)
+                eroded = cv2.erode(mask_u8, kernel, iterations=1)
+                boundary = (mask_u8 ^ eroded).astype(bool)
+                
+                if boundary.any():
+                    mean_ridge = ridge_norm[boundary].mean()
+                    boundary_ridges.append(mean_ridge)
+        
+        # Calculate metrics
+        avg_circularity = np.mean(circularities) if circularities else 0.0
+        avg_solidity = np.mean(solidities) if solidities else 0.0
+        avg_boundary_ridge = np.mean(boundary_ridges) if boundary_ridges else 0.0
+        
+        # Coefficient of variation for size consistency (lower = more uniform)
+        size_cv = (np.std(areas) / np.mean(areas)) if len(areas) > 1 else 0.0
+        
+        # PRECISION SCORE (0-100)
+        # High circularity + high solidity + low size variation = good precision
+        circularity_score = avg_circularity * 30  # max 30 points
+        solidity_score = avg_solidity * 30  # max 30 points
+        boundary_score = avg_boundary_ridge * 25  # max 25 points
+        consistency_score = max(0, (1 - min(size_cv, 1.0))) * 15  # max 15 points (lower CV = higher score)
+        
+        precision_score = circularity_score + solidity_score + boundary_score + consistency_score
+        
+        return {
+            'avg_circularity': avg_circularity,
+            'avg_solidity': avg_solidity,
+            'avg_boundary_ridge': avg_boundary_ridge,
+            'size_cv': size_cv,
+            'precision_score': precision_score,
+            'num_grains': len(circularities)
+        }
+
+    def create_visualization(self, imv, ridge, skel_img, masks_overlay, name, num_raw, num_kept, base_name, timestamp, quality_metrics):
+        """Create and save matplotlib visualization with quality metrics"""
+        plt.figure(figsize=(20, 5))
+
+        plt.subplot(1, 5, 1)
+        plt.imshow(imv, cmap="gray", vmin=0, vmax=1)
+        plt.title(f"{name} (input)")
+        plt.axis("off")
+
+        plt.subplot(1, 5, 2)
+        plt.imshow(ridge, cmap="hot")
+        plt.title("Ridge response (Sato)")
+        plt.axis("off")
+
+        plt.subplot(1, 5, 3)
+        plt.imshow(skel_img, cmap="gray", vmin=0, vmax=255)
+        plt.title("Skeleton (Sato > percentile)")
+        plt.axis("off")
+
+        plt.subplot(1, 5, 4)
+        plt.imshow(masks_overlay)
+        plt.title(f"SAM grains (coloured)\nraw={num_raw}, kept={num_kept}")
+        plt.axis("off")
+
+        # Add quality metrics panel
+        plt.subplot(1, 5, 5)
+        plt.axis('off')
+        metrics_text = (
+            f"QUALITY METRICS\n"
+            f"{'='*25}\n\n"
+            f"Circularity: {quality_metrics['avg_circularity']:.3f}\n"
+            f"  (1.0 = perfect circles)\n"
+            f"  (<0.6 = might be merged)\n\n"
+            f"Solidity: {quality_metrics['avg_solidity']:.3f}\n"
+            f"  (1.0 = no holes/dips)\n"
+            f"  (<0.9 = irregular)\n\n"
+            f"Boundary Ridge: {quality_metrics['avg_boundary_ridge']:.3f}\n"
+            f"  (higher = clearer edges)\n\n"
+            f"Size CV: {quality_metrics['size_cv']:.3f}\n"
+            f"  (lower = consistent)\n\n"
+            f"{'='*25}\n"
+            f"PRECISION SCORE\n"
+            f"{quality_metrics['precision_score']:.1f}/100\n\n"
+            f"{'✅ Good' if quality_metrics['precision_score'] > 70 else '⚠️ Check' if quality_metrics['precision_score'] > 50 else '❌ Poor'}\n"
+        )
+        
+        plt.text(0.1, 0.5, metrics_text, fontsize=10, family='monospace',
+                verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        plt.tight_layout()
+        
+        fig_path = OUTPUT_DIR / f"{base_name}_{name}_{timestamp}_full_analysis.png"
+        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        self.progress.emit(f"  ✓ Saved visualization: {fig_path.name}")
+
+    def create_comparison_report(self, all_results, base_name, timestamp):
+        """Create a comparison report ranking ALL profile+variant combinations by precision score"""
+        
+        # Sort by precision score (highest first)
+        sorted_results = sorted(all_results, key=lambda x: x['metrics']['precision_score'], reverse=True)
+        
+        self.progress.emit(f"\n{'='*80}")
+        self.progress.emit("📊 FINAL COMPARISON - ALL PROFILES & VARIANTS RANKED BY PRECISION SCORE")
+        self.progress.emit(f"{'='*80}")
+        
+        report_lines = []
+        report_lines.append("GRAIN DETECTION COMPARISON REPORT - ALL PROFILES")
+        report_lines.append("=" * 90)
+        report_lines.append(f"Image: {base_name}")
+        report_lines.append(f"Analysis Time: {timestamp}")
+        report_lines.append(f"Total Combinations Tested: {len(all_results)}")
+        report_lines.append("")
+        report_lines.append("RANKED BY PRECISION SCORE (Higher = Better Grain Separation)")
+        report_lines.append("=" * 90)
+        report_lines.append("")
+        
+        # Show top 15 results
+        display_count = min(15, len(sorted_results))
+        
+        for i, result in enumerate(sorted_results[:display_count], 1):
+            profile = result['profile']
+            variant = result['variant']
+            metrics = result['metrics']
+            
+            rank_marker = "#1" if i == 1 else "#2" if i == 2 else "#3" if i == 3 else f"#{i:2d}"
+            
+            line = (f"{rank_marker:4s} {profile:25s} | {variant:18s} | "
+                   f"Score: {metrics['precision_score']:5.1f} | "
+                   f"Grains: {result['kept_masks']:3d} | "
+                   f"Circ: {metrics['avg_circularity']:.2f} | "
+                   f"Solid: {metrics['avg_solidity']:.2f}")
+            
+            self.progress.emit(line)
+            report_lines.append(line)
+        
+        report_lines.append("")
+        report_lines.append("=" * 90)
+        report_lines.append("HOW TO INTERPRET:")
+        report_lines.append("  * PRECISION SCORE > 70  = Excellent separation, use this!")
+        report_lines.append("  * PRECISION SCORE 50-70 = Okay, some grains might be merged")
+        report_lines.append("  * PRECISION SCORE < 50  = Poor, many merged grains")
+        report_lines.append("")
+        report_lines.append("  Circularity > 0.7  = Round grains (not merged)")
+        report_lines.append("  Solidity > 0.9     = Solid grains (no holes from merging)")
+        report_lines.append("")
+        best_model = sorted_results[0].get('model', 'sam_b.pt')
+        best_model_short = "SAM-B" if "sam_b" in best_model else "SAM-L"
+        report_lines.append(f"*** BEST COMBINATION: {best_model_short} + {sorted_results[0]['profile']} + {sorted_results[0]['variant']}")
+        report_lines.append(f"    Precision Score: {sorted_results[0]['metrics']['precision_score']:.1f}/100")
+        report_lines.append(f"    Detected {sorted_results[0]['kept_masks']} grains")
+        report_lines.append(f"    Use this model + profile in your main analysis!")
+        report_lines.append("")
+        report_lines.append("ALL RESULTS (Full List):")
+        report_lines.append("-" * 90)
+        
+        # Add all results to file
+        for i, result in enumerate(sorted_results, 1):
+            model = result.get('model', 'sam_b.pt')
+            model_short = "SAM-B" if "sam_b" in model else "SAM-L"
+            profile = result['profile']
+            variant = result['variant']
+            metrics = result['metrics']
+            line = (f"{i:3d}. {model_short:6s} | {profile:20s} | {variant:18s} | "
+                   f"Score: {metrics['precision_score']:5.1f} | "
+                   f"Grains: {result['kept_masks']:3d} | "
+                   f"Circ: {metrics['avg_circularity']:.2f} | "
+                   f"Solid: {metrics['avg_solidity']:.2f}")
+            report_lines.append(line)
+        
+        # Save to file
+        report_path = OUTPUT_DIR / f"{base_name}_{timestamp}_COMPARISON_REPORT.txt"
+        with open(report_path, 'w') as f:
+            f.write('\n'.join(report_lines))
+        
+        self.progress.emit(f"\n[SAVED] Full comparison report: {report_path.name}")
+
+    def create_union_image(self, all_results, gray8, base_name, timestamp):
+        """Create a single image showing ALL grains detected by ANY profile"""
+        self.progress.emit("  Merging grain detections from all profiles...")
+        
+        if not all_results:
+            self.progress.emit("  ⚠️ No results to combine!")
+            return
+        
+        # Start with grayscale base
+        base_rgb = cv2.cvtColor(gray8, cv2.COLOR_GRAY2RGB)
+        union_colored_mask = np.zeros(base_rgb.shape[:2], dtype=bool)
+        union_overlay = base_rgb.copy().astype(np.float32)
+        
+        total_grains = 0
+        profiles_with_overlays = 0
+        
+        # Collect all colored pixels from all profiles
+        for result in all_results:
+            if 'overlay' in result:
+                profiles_with_overlays += 1
+                overlay = result['overlay']
+                
+                # Find colored pixels (non-gray pixels)
+                # A pixel is colored if it differs from the grayscale base
+                gray_repeated = np.stack([gray8, gray8, gray8], axis=2)
+                is_colored = ~np.all(overlay == gray_repeated, axis=2)
+                
+                # Copy colored pixels that haven't been colored yet
+                new_pixels = is_colored & ~union_colored_mask
+                if new_pixels.any():
+                    union_overlay[new_pixels] = overlay[new_pixels]
+                    union_colored_mask |= new_pixels
+                
+                total_grains += result['kept_masks']
+        
+        self.progress.emit(f"  ✓ Found {profiles_with_overlays} profiles with overlay data")
+        
+        if profiles_with_overlays == 0:
+            self.progress.emit("  ⚠️ No overlay data found in results!")
+            return
+        
+        union_overlay = union_overlay.astype(np.uint8)
+        
+        # Count actual unique grains by counting unique colors
+        # Each grain has a unique RGB color assigned during coloring
+        # Convert to tuples and use set to find unique colors
+        colored_pixels = union_overlay[union_colored_mask]
+        unique_colors = set()
+        for pixel in colored_pixels:
+            color_tuple = tuple(pixel)
+            # Skip grayscale pixels (R=G=B)
+            if color_tuple[0] != color_tuple[1] or color_tuple[1] != color_tuple[2]:
+                unique_colors.add(color_tuple)
+        
+        num_unique_grains = len(unique_colors)  # Each unique color = one grain
+        
+        self.progress.emit(f"  ✓ Combined {len(all_results)} profile results")
+        self.progress.emit(f"  🎯 UNIQUE GRAINS DETECTED IN UNION: {num_unique_grains}")
+        
+        # Save union image with grain count in filename
+        union_path = OUTPUT_DIR / f"{base_name}_{timestamp}_UNION_{num_unique_grains}_GRAINS.png"
+        success = cv2.imwrite(str(union_path), cv2.cvtColor(union_overlay, cv2.COLOR_RGB2BGR))
+        
+        if success:
+            self.progress.emit(f"  ✅ SAVED: {union_path.name}")
+            self.progress.emit(f"     Full path: {union_path.absolute()}")
+            self.progress.emit(f"     This image shows {num_unique_grains} unique grains from all profiles!")
+        else:
+            self.progress.emit(f"  ❌ FAILED to save union image!")
+            self.progress.emit(f"     Attempted path: {union_path.absolute()}")
+
+
+class ExperimentalGrainAnalysisUI(QMainWindow):
+    """Main UI window for experimental grain analysis"""
+
+    def __init__(self):
+        super().__init__()
+        self.img_path = None
+        self.worker = None
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Experimental Grain Analysis - SAM-B with Ridge Filtering")
+        self.setGeometry(100, 100, 800, 700)
+
+        # Main widget
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+
+        # Title
+        title = QLabel("🔬 Experimental Grain Analysis")
+        title.setFont(QFont("Arial", 16, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # File selection
+        file_group = QGroupBox("Image Selection")
+        file_layout = QHBoxLayout()
+        self.file_label = QLabel("No image selected")
+        self.file_label.setWordWrap(True)
+        file_btn = QPushButton("📁 Select Image")
+        file_btn.clicked.connect(self.select_image)
+        file_layout.addWidget(self.file_label, 3)
+        file_layout.addWidget(file_btn, 1)
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+
+        # Info about what will be tested
+        info_group = QGroupBox("🔬 Automatic Profile Testing")
+        info_layout = QVBoxLayout()
+        total_variants = sum(len(PRESET_PROFILES[p]['variants']) for p in PRESET_PROFILES.keys())
+        
+        tiling_status = f"ENABLED ({TILE_SIZE}x{TILE_SIZE} px tiles)" if ENABLE_TILING else "DISABLED"
+        
+        info_text = QLabel(
+            f"<b>🎯 Using SAM-B for Maximum Precision</b><br>"
+            f"<i>SAM-B detects fewer grains but with correct separation (no merging)</i><br><br>"
+            f"<b>📐 Smart Image Tiling: {tiling_status}</b><br>"
+            f"<i>Large images (>{MIN_IMAGE_SIZE_FOR_TILING}px) split into tiles for zoom-level quality!</i><br><br>"
+            f"When you select an image, the system will automatically test <b>{len(PRESET_PROFILES)} optimized profiles</b>:<br><br>"
+            + "<br>".join([f"• <b>{name}</b>: {PRESET_PROFILES[name]['description']}" 
+                          for name in PRESET_PROFILES.keys()])
+            + f"<br><br><b>Total: {total_variants} carefully selected combinations</b> will be tested and ranked!<br>"
+            + "<br><i>These are the top-performing configurations optimized for precision.</i>"
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet("QLabel { padding: 10px; background-color: #e8f4f8; border-radius: 5px; }")
+        info_layout.addWidget(info_text)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+
+
+        # Run button
+        self.run_btn = QPushButton("▶️ Run Analysis")
+        self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-size: 14px; padding: 10px; }")
+        self.run_btn.clicked.connect(self.run_analysis)
+        self.run_btn.setEnabled(False)
+        layout.addWidget(self.run_btn)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # Log output
+        log_group = QGroupBox("Analysis Log")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+
+        # Output directory button
+        output_btn = QPushButton("📂 Open Output Folder")
+        output_btn.clicked.connect(self.open_output_folder)
+        layout.addWidget(output_btn)
+
+        total_variants = sum(len(PRESET_PROFILES[p]['variants']) for p in PRESET_PROFILES.keys())
+        self.log_message(f"✅ Ready! Output directory: {OUTPUT_DIR.absolute()}")
+        self.log_message(f"🎯 Using SAM-B for maximum precision (correct grain separation)")
+        self.log_message(f"📋 Will test {len(PRESET_PROFILES)} optimized profiles with {total_variants} total variants")
+
+    def select_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select SEM Image",
+            "",
+            "Images (*.tiff *.tif *.png *.jpg *.jpeg *.bmp);;All Files (*)"
+        )
+        
+        if file_path:
+            self.img_path = Path(file_path)
+            self.file_label.setText(f"Selected: {self.img_path.name}")
+            self.run_btn.setEnabled(True)
+            self.log_message(f"📷 Image selected: {self.img_path}")
+
+    def run_analysis(self):
+        if not self.img_path or not self.img_path.exists():
+            self.log_message("❌ Please select a valid image file")
+            return
+
+        # Disable controls
+        self.run_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Indeterminate
+
+        total_variants = sum(len(PRESET_PROFILES[p]['variants']) for p in PRESET_PROFILES.keys())
+        
+        self.log_message("\n" + "="*80)
+        self.log_message("🚀 Starting optimized analysis with SAM-B (Precision Mode)...")
+        self.log_message(f"📊 Testing {len(PRESET_PROFILES)} profiles with {total_variants} total variants")
+        self.log_message("="*80)
+
+        # Create and start worker
+        self.worker = AnalysisWorker(self.img_path, all_profiles=True)
+        self.worker.progress.connect(self.log_message)
+        self.worker.finished.connect(self.on_analysis_finished)
+        self.worker.error.connect(self.on_analysis_error)
+        self.worker.start()
+
+    def on_analysis_finished(self):
+        self.progress_bar.setVisible(False)
+        self.run_btn.setEnabled(True)
+        self.log_message("\n✅ Analysis completed successfully!")
+
+    def on_analysis_error(self, error_msg):
+        self.progress_bar.setVisible(False)
+        self.run_btn.setEnabled(True)
+        self.log_message(f"\n❌ Error: {error_msg}")
+
+    def log_message(self, message):
+        self.log_text.append(message)
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+
+    def open_output_folder(self):
+        import os
+        import subprocess
+        if sys.platform == 'win32':
+            os.startfile(OUTPUT_DIR)
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', OUTPUT_DIR])
+        else:
+            subprocess.run(['xdg-open', OUTPUT_DIR])
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ExperimentalGrainAnalysisUI()
+    window.show()
+    sys.exit(app.exec_())
