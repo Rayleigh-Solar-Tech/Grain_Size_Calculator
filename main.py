@@ -204,7 +204,15 @@ def run_cli(image_path, config_file=None, output_dir=None):
         
         # Initialize analysis components
         print("Initializing SAM model...")
-        analyzer, feret_calc, measurements = create_complete_analyzer(um_per_pixel=um_per_px)
+        analyzer, feret_calc, measurements = create_complete_analyzer(
+            model_gpu=processing_config.model_gpu,
+            model_cpu=processing_config.model_cpu,
+            um_per_pixel=um_per_px,
+            enable_tiling=processing_config.enable_tiling,
+            tile_size=processing_config.tile_size,
+            tile_overlap=processing_config.tile_overlap,
+            min_image_size_for_tiling=processing_config.min_image_size_for_tiling
+        )
         
         # Setup results processing
         base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -232,12 +240,34 @@ def run_cli(image_path, config_file=None, output_dir=None):
             gray_work, scale = resize_for_processing(gray_enh, processing_config.max_side_cpu)
             rgb8 = prep_rgb8(gray_work)
             
-            # Run SAM
-            sam_results, proc_time = analyzer.segment_grains(rgb8)
+            # Run SAM with optional ridge filtering
+            ridge_config = None
+            if processing_config.apply_ridge_filtering:
+                ridge_config = {
+                    'ridge_threshold': processing_config.ridge_threshold,
+                    'tv_weight': processing_config.ridge_tv_weight,
+                    'ridge_percentile': processing_config.ridge_percentile,
+                    'min_size': processing_config.ridge_min_size
+                }
             
-            # Process results
+            sam_results, proc_time, filtered_data = analyzer.segment_grains(
+                rgb8, 
+                apply_ridge_filtering=processing_config.apply_ridge_filtering,
+                ridge_config=ridge_config
+            )
+            
+            # Process results - use ONLY filtered masks if ridge filtering is enabled
             area_threshold = processing_config.min_area_px if scale == 1.0 else int(round(processing_config.min_area_px * (scale**2)))
-            label_small = analyzer.masks_to_labels(getattr(sam_results[0], "masks", None), min_area=area_threshold)
+            
+            if processing_config.apply_ridge_filtering and filtered_data is not None:
+                # Use ONLY the accepted/colored grains
+                print(f"    Using {len(filtered_data['accepted_masks'])} ridge-filtered grains (of {sam_results[0].masks.data.shape[0] if hasattr(sam_results[0].masks, 'data') else 0} SAM masks)")
+                
+                # Convert accepted masks to label image
+                label_small = analyzer.create_label_from_masks(filtered_data['accepted_masks'], min_area=area_threshold)
+            else:
+                # Use all SAM masks (backward compatibility)
+                label_small = analyzer.masks_to_labels(getattr(sam_results[0], "masks", None), min_area=area_threshold)
             
             if label_small is not None and scale != 1.0:
                 import cv2
@@ -260,6 +290,14 @@ def run_cli(image_path, config_file=None, output_dir=None):
             variant_results.append(result)
             
             print(f"    Detected {len(grain_data)} grains, {result['grains_used']} used")
+            
+            # Save ridge-filtered colored image if ridge filtering was used
+            if filtered_data is not None and 'colored_image' in filtered_data:
+                ridge_output_path = os.path.join(output_dir, f"{base_name}_{variant.name}_ridge_filtered.png")
+                import matplotlib.pyplot as plt
+                plt.imsave(ridge_output_path, filtered_data['colored_image'])
+                print(f"    Ridge-filtered image saved: {os.path.basename(ridge_output_path)}")
+                print(f"    Unique grains (by color): {filtered_data['unique_grain_count']}")
             
             # Save overlay if enabled
             if processing_config.save_overlays and grain_data:

@@ -6,6 +6,7 @@ Handles the heavy processing in a separate thread to keep UI responsive.
 import os
 import time
 import traceback
+import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Import our core modules
@@ -16,6 +17,7 @@ from core.image_processing import (load_and_convert_to_grayscale, param_enhance,
                                  prep_rgb8, resize_for_processing, create_overlay_visualization)
 from core.sam_analysis import create_complete_analyzer
 from core.results import create_complete_results_processor
+from core.pdf_report import create_pdf_report_generator
 from core.config import ProcessingConfig
 import matplotlib.pyplot as plt
 
@@ -61,9 +63,17 @@ class AnalysisWorker(QThread):
         min_area_px = self.params['min_area_px']
         apply_feret_cap = self.params['apply_feret_cap']
         feret_cap_um = self.params['feret_cap_um']
+        save_all_data = self.params.get('save_all_data', False)
         save_overlays = self.params['save_overlays']
         annotate_measurements = self.params['annotate_measurements']
         variants = self.params['variants']
+        
+        # Ridge filtering parameters (with defaults for backward compatibility)
+        apply_ridge_filtering = self.params.get('apply_ridge_filtering', False)
+        ridge_threshold = self.params.get('ridge_threshold', 0.15)
+        ridge_tv_weight = self.params.get('ridge_tv_weight', 0.01)
+        ridge_percentile = self.params.get('ridge_percentile', 70)
+        ridge_min_size = self.params.get('ridge_min_size', 50)
         
         self.log_message.emit(f"Starting analysis of: {os.path.basename(image_path)}")
         self.progress_updated.emit(5, "Loading image...")
@@ -87,12 +97,24 @@ class AnalysisWorker(QThread):
         
         self.progress_updated.emit(10, "Initializing SAM model...")
         
+        # Get tiling config from params (with defaults)
+        enable_tiling = self.params.get('enable_tiling', True)
+        tile_size = self.params.get('tile_size', 1024)
+        tile_overlap = self.params.get('tile_overlap', 128)
+        min_image_size_for_tiling = self.params.get('min_image_size_for_tiling', 2048)
+        model_gpu = self.params.get('model_gpu', 'sam_b.pt')
+        model_cpu = self.params.get('model_cpu', 'sam_b.pt')
+        
         # Initialize analysis components with explicit model names
         analyzer, feret_calc, measurements = create_complete_analyzer(
-            model_gpu="sam_l.pt",
-            model_cpu="sam_l.pt", 
+            model_gpu=model_gpu,
+            model_cpu=model_cpu, 
             device=None,  # Auto-detect
-            um_per_pixel=um_per_px
+            um_per_pixel=um_per_px,
+            enable_tiling=enable_tiling,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            min_image_size_for_tiling=min_image_size_for_tiling
         )
         
         # Log device information
@@ -119,6 +141,7 @@ class AnalysisWorker(QThread):
         
         # Process each variant
         variant_results = []
+        overlay_paths = {}  # Track overlay paths for PDF report
         total_variants = len(variants)
         
         for i, variant in enumerate(variants):
@@ -145,18 +168,43 @@ class AnalysisWorker(QThread):
                 gray_work, scale = resize_for_processing(gray_enh, 1536)  # Higher resolution for better results
                 rgb8 = prep_rgb8(gray_work)
                 
-                # Run SAM segmentation
+                # Run SAM segmentation with optional ridge filtering
                 self.log_message.emit(f"  Running SAM segmentation...")
                 start_time = time.time()
-                sam_results, processing_time = analyzer.segment_grains(rgb8)
+                
+                # Prepare ridge config if enabled
+                ridge_config = None
+                if apply_ridge_filtering:
+                    ridge_config = {
+                        'ridge_threshold': ridge_threshold,
+                        'tv_weight': ridge_tv_weight,
+                        'ridge_percentile': ridge_percentile,
+                        'min_size': ridge_min_size
+                    }
+                    self.log_message.emit(f"  Ridge filtering enabled (threshold={ridge_threshold})")
+                
+                sam_results, processing_time, filtered_data = analyzer.segment_grains(
+                    rgb8, 
+                    apply_ridge_filtering=apply_ridge_filtering,
+                    ridge_config=ridge_config
+                )
                 self.log_message.emit(f"  SAM processing completed in {processing_time:.2f}s")
                 
-                # Convert masks to labels
+                # Convert masks to labels - use ONLY filtered masks if ridge filtering is enabled
                 area_threshold = min_area_px if scale == 1.0 else int(round(min_area_px * (scale**2)))
-                label_small = analyzer.masks_to_labels(
-                    getattr(sam_results[0], "masks", None), 
-                    min_area=area_threshold
-                )
+                
+                if apply_ridge_filtering and filtered_data is not None:
+                    # Use ONLY the accepted/colored grains
+                    total_sam_masks = sam_results[0].masks.data.shape[0] if hasattr(sam_results[0].masks, 'data') else 0
+                    self.log_message.emit(f"  Ridge filtering: {len(filtered_data['accepted_masks'])} grains kept (of {total_sam_masks} SAM masks)")
+                    self.log_message.emit(f"  Unique grains by color: {filtered_data['unique_grain_count']}")
+                    label_small = analyzer.create_label_from_masks(filtered_data['accepted_masks'], min_area=area_threshold)
+                else:
+                    # Use all SAM masks (backward compatibility)
+                    label_small = analyzer.masks_to_labels(
+                        getattr(sam_results[0], "masks", None), 
+                        min_area=area_threshold
+                    )
                 
                 # Resize labels back to original size if needed
                 if label_small is not None and scale != 1.0:
@@ -166,7 +214,6 @@ class AnalysisWorker(QThread):
                     label_full = label_small
                 
                 grains_detected = int(label_full.max()) if (label_full is not None and label_full.size) else 0
-                self.log_message.emit(f"  Detected {grains_detected} grains")
                 
                 # Calculate grain measurements
                 grain_data = []
@@ -180,19 +227,41 @@ class AnalysisWorker(QThread):
                 )
                 variant_results.append(result)
                 
-                self.log_message.emit(f"  Variant completed: {result['grains_used']} grains used")
+                self.log_message.emit(f"  ✓ Final grain count: {result['grains_used']} grains (after size/quality filtering)")
                 
-                # Save overlay if requested
-                if save_overlays and grains_detected > 0:
-                    from core.image_processing import normalize01
-                    disp01 = normalize01(gray_enh)
-                    overlay = create_overlay_visualization(
-                        disp01, label_full, grain_data, annotate_measurements
-                    )
-                    
-                    overlay_path = os.path.join(out_dir, f"{base_name}_{variant_name}_overlay.png")
-                    plt.imsave(overlay_path, overlay)
-                    self.log_message.emit(f"  Overlay saved: {os.path.basename(overlay_path)}")
+                # Save ridge-filtered colored image if ridge filtering was used and grains were detected (only if save_all_data)
+                if save_all_data and filtered_data is not None and 'colored_image' in filtered_data and len(filtered_data.get('accepted_masks', [])) > 0:
+                    try:
+                        # Ensure output directory exists
+                        os.makedirs(out_dir, exist_ok=True)
+                        # Normalize path to avoid mixed separators
+                        ridge_output_path = os.path.normpath(os.path.join(out_dir, f"{base_name}_{variant_name}_ridge_filtered.png"))
+                        # Convert colored_image to proper format for saving
+                        colored_img = filtered_data['colored_image']
+                        if colored_img.dtype == np.uint8:
+                            colored_img = colored_img.astype(np.float32) / 255.0
+                        plt.imsave(ridge_output_path, colored_img)
+                        self.log_message.emit(f"  Ridge-filtered image saved: {os.path.basename(ridge_output_path)}")
+                    except Exception as e:
+                        self.log_message.emit(f"  Warning: Could not save ridge-filtered image: {e}")
+                
+                # Save overlay if requested (always save for PDF, store path)
+                if grains_detected > 0:
+                    try:
+                        from core.image_processing import normalize01
+                        disp01 = normalize01(gray_enh)
+                        overlay = create_overlay_visualization(
+                            disp01, label_full, grain_data, annotate_measurements
+                        )
+                        
+                        # Normalize path to avoid mixed separators
+                        overlay_path = os.path.normpath(os.path.join(out_dir, f"{base_name}_{variant_name}_overlay.png"))
+                        os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
+                        plt.imsave(overlay_path, overlay)
+                        overlay_paths[variant_name] = overlay_path  # Track for PDF report
+                        self.log_message.emit(f"  Overlay saved: {os.path.basename(overlay_path)}")
+                    except Exception as e:
+                        self.log_message.emit(f"  Warning: Could not save overlay: {e}")
                 
             except Exception as e:
                 error_msg = f"Error processing variant {variant_name}: {str(e)}"
@@ -221,30 +290,84 @@ class AnalysisWorker(QThread):
             'um_per_pixel': um_per_px
         }
         
+        # Always export CSV files (needed for PDF), but will be deleted if save_all_data=False
         exported_files = exporter.export_all_formats(
             variant_results, 
             combined_results, 
             processing_config_dict
         )
         
-        self.log_message.emit("Results exported:")
-        for format_name, file_path in exported_files.items():
-            self.log_message.emit(f"  {format_name}: {os.path.basename(file_path)}")
+        if save_all_data:
+            self.log_message.emit("Results exported:")
+            for format_name, file_path in exported_files.items():
+                self.log_message.emit(f"  {format_name}: {os.path.basename(file_path)}")
         
-        # Create visualizations
-        self.progress_updated.emit(95, "Creating visualizations...")
+        # Create visualizations only if save_all_data is enabled
+        if save_all_data:
+            self.progress_updated.emit(95, "Creating visualizations...")
+            
+            try:
+                plot_files = visualizer.create_distribution_plots(variant_results, base_name)
+                comparison_plot = visualizer.create_summary_comparison(variant_results, base_name)
+                
+                self.log_message.emit("Visualizations created:")
+                for plot_file in plot_files:
+                    self.log_message.emit(f"  {os.path.basename(plot_file)}")
+                self.log_message.emit(f"  {os.path.basename(comparison_plot)}")
+                
+            except Exception as e:
+                self.log_message.emit(f"Warning: Could not create visualizations: {str(e)}")
+        
+        # Create comprehensive PDF report
+        self.progress_updated.emit(97, "Generating PDF report...")
         
         try:
-            plot_files = visualizer.create_distribution_plots(variant_results, base_name)
-            comparison_plot = visualizer.create_summary_comparison(variant_results, base_name)
+            pdf_generator = create_pdf_report_generator(out_dir, base_name)
             
-            self.log_message.emit("Visualizations created:")
-            for plot_file in plot_files:
-                self.log_message.emit(f"  {os.path.basename(plot_file)}")
-            self.log_message.emit(f"  {os.path.basename(comparison_plot)}")
+            metadata_dict = {
+                'image_path': image_path,
+                'image_dimensions': (W0, H0),
+                'um_per_pixel': um_per_px,
+                'frame_width_um': frame_width_um,
+                'total_variants': len(variants)
+            }
+            
+            self.log_message.emit(f"Creating PDF with {len(exported_files)} CSV files...")
+            print(f"DEBUG: exported_files keys = {list(exported_files.keys())}")
+            
+            pdf_path = pdf_generator.create_complete_report(
+                variant_results=variant_results,
+                combined_results=combined_results,
+                processing_config=processing_config_dict,
+                metadata=metadata_dict,
+                overlay_paths=overlay_paths,
+                exported_files=exported_files
+            )
+            
+            self.log_message.emit(f"📄 PDF Report created: {os.path.basename(pdf_path)}")
+            
+            # Clean up temporary files if not saving all data
+            if not save_all_data:
+                # Delete overlay images
+                for overlay_path in overlay_paths.values():
+                    try:
+                        if os.path.exists(overlay_path):
+                            os.remove(overlay_path)
+                    except Exception as e:
+                        pass  # Silently ignore cleanup errors
+                
+                # Delete CSV files
+                for file_path in exported_files.values():
+                    try:
+                        if os.path.exists(file_path) and file_path.endswith('.csv'):
+                            os.remove(file_path)
+                    except Exception as e:
+                        pass  # Silently ignore cleanup errors
+                
+                self.log_message.emit("Temporary files cleaned up (only PDF saved)")
             
         except Exception as e:
-            self.log_message.emit(f"Warning: Could not create visualizations: {str(e)}")
+            self.log_message.emit(f"Warning: Could not create PDF report: {str(e)}")
         
         # Prepare final results
         final_results = {

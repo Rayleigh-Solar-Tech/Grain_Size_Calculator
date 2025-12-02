@@ -129,55 +129,70 @@ def font_params_for_size(height, width):
 
 
 def create_overlay_visualization(base_image, label_image, grain_data, 
-                               annotate_measurements=True, font=cv2.FONT_HERSHEY_SIMPLEX):
+                               annotate_measurements=False, font=cv2.FONT_HERSHEY_SIMPLEX):
     """
-    Create visualization overlay with grain measurements.
+    Create visualization overlay with colored grains (experimental UI style).
+    Each grain gets a unique random color, no length annotations by default.
     
     Args:
         base_image: Base grayscale image (normalized 0-1)
         label_image: Label image with grain IDs
         grain_data: List of grain measurement dictionaries
-        annotate_measurements: Whether to annotate each measurement
+        annotate_measurements: Whether to annotate measurements (disabled by default)
         font: Font for text annotations
         
     Returns:
         RGB overlay image (0-1 range)
     """
-    # Create RGB base
-    overlay = np.dstack([base_image] * 3).copy()
-    H, W = base_image.shape[:2]
+    # Convert base image to RGB uint8 (0-255 range) for coloring
+    base_u8 = (base_image * 255).astype(np.uint8)
+    overlay_u8 = np.dstack([base_u8, base_u8, base_u8])
     
-    # Font parameters
-    font_scale, font_thickness = font_params_for_size(H, W)
-    
-    # Draw measurements
-    for grain in grain_data:
-        x1, y1 = int(round(grain["p1"][0])), int(round(grain["p1"][1]))
-        x2, y2 = int(round(grain["p2"][0])), int(round(grain["p2"][1]))
-        length_um = grain.get("length_um", 0)
-        
-        # Draw measurement line
-        cv2.line(overlay, (x1, y1), (x2, y2), (0, 1, 1), 1, cv2.LINE_AA)
-        
-        # Add text annotation
-        if annotate_measurements and length_um > 0:
-            mx, my = (x1 + x2) // 2, (y1 + y2) // 2
-            txt = f"{length_um:.2f} µm"
-            
-            # Draw text with black outline
-            cv2.putText(overlay, txt, (mx + 1, my + 1), font, font_scale, 
-                       (0, 0, 0), max(1, font_thickness + 1), cv2.LINE_AA)
-            cv2.putText(overlay, txt, (mx, my), font, font_scale, 
-                       (1, 1, 1), font_thickness, cv2.LINE_AA)
-    
-    # Add colored mask overlay
+    # Color each grain with unique random color (like experimental UI)
     if label_image is not None and label_image.max() > 0:
-        from matplotlib import cm
-        grains = int(label_image.max())
-        cmap = cm.get_cmap("tab20", grains + 1)
-        label_rgb = cmap(label_image)[:, :, :3]
-        alpha = (label_image > 0).astype(float) * 0.20
-        overlay = (overlay * (1 - alpha[..., None]) + 
-                  label_rgb * alpha[..., None]).clip(0, 1)
+        rng = np.random.default_rng(42)  # Fixed seed for consistency
+        colored_mask = np.zeros(overlay_u8.shape[:2], dtype=bool)
+        
+        num_grains = int(label_image.max())
+        for grain_id in range(1, num_grains + 1):
+            mask = label_image == grain_id
+            if not mask.any():
+                continue
+            
+            # Generate unique color for this grain (80-255 range for visibility)
+            color = rng.integers(low=80, high=255, size=3, dtype=np.uint8)
+            
+            # Only color pixels that haven't been colored yet (anti-overwrite)
+            new_pixels = mask & ~colored_mask
+            if new_pixels.any():
+                overlay_u8[new_pixels, 0] = color[0]
+                overlay_u8[new_pixels, 1] = color[1]
+                overlay_u8[new_pixels, 2] = color[2]
+                colored_mask |= new_pixels
+    
+    # Convert back to 0-1 range for consistency with rest of pipeline
+    overlay = overlay_u8.astype(np.float32) / 255.0
+    
+    # Optionally add length annotations (disabled by default now)
+    if annotate_measurements and grain_data:
+        H, W = base_image.shape[:2]
+        font_scale, font_thickness = font_params_for_size(H, W)
+        
+        for grain in grain_data:
+            x1, y1 = int(round(grain["p1"][0])), int(round(grain["p1"][1]))
+            x2, y2 = int(round(grain["p2"][0])), int(round(grain["p2"][1]))
+            length_um = grain.get("length_um", 0)
+            
+            if length_um > 0:
+                # Draw measurement line
+                cv2.line(overlay, (x1, y1), (x2, y2), (0, 1, 1), 1, cv2.LINE_AA)
+                
+                # Add text
+                mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+                txt = f"{length_um:.2f} µm"
+                cv2.putText(overlay, txt, (mx + 1, my + 1), font, font_scale, 
+                           (0, 0, 0), max(1, font_thickness + 1), cv2.LINE_AA)
+                cv2.putText(overlay, txt, (mx, my), font, font_scale, 
+                           (1, 1, 1), font_thickness, cv2.LINE_AA)
     
     return overlay

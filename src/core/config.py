@@ -38,15 +38,28 @@ class AnalysisVariant:
 @dataclass
 class ProcessingConfig:
     """Main processing configuration."""
-    # Model settings - using large model for best accuracy
-    model_gpu: str = "sam_l.pt"    # Large model for best accuracy
-    model_cpu: str = "sam_l.pt"    # Large model even on CPU
+    # Model settings - using SAM-B for high precision (correct grain separation)
+    model_gpu: str = "sam_b.pt"    # SAM-B for precision (no merged grains)
+    model_cpu: str = "sam_b.pt"    # SAM-B even on CPU
     max_side_cpu: int = 1536       # Higher resolution for better accuracy
     
     # Analysis settings
     min_area_px: int = 50
     apply_feret_cap: bool = True
     feret_cap_um: float = 5.0
+    
+    # Ridge filtering settings (NEW - experimental feature)
+    apply_ridge_filtering: bool = True   # Enabled by default with SAM-B
+    ridge_threshold: float = 0.15        # Minimum ridge density to accept grain (0.10-0.20 range)
+    ridge_tv_weight: float = 0.01        # Total variation denoising weight
+    ridge_percentile: int = 70           # Percentile for ridge threshold calculation
+    ridge_min_size: int = 50             # Minimum edge object size to keep
+    
+    # Image tiling settings (for large images)
+    enable_tiling: bool = True           # Enable automatic tiling for large images
+    tile_size: int = 1024                # Size of each tile in pixels
+    tile_overlap: int = 128              # Overlap between tiles to avoid edge artifacts
+    min_image_size_for_tiling: int = 2048  # Only tile images larger than this
     
     # Output settings
     save_overlays: bool = True
@@ -69,14 +82,14 @@ class ProcessingConfig:
 class ConfigManager:
     """Manage analysis configurations and variants."""
     
-    # Default analysis variants from original code
+    # Default analysis variants - optimized experimental profiles
     DEFAULT_VARIANTS = [
-        AnalysisVariant("v22_cl1.3_t12_g0.98_us0.70_s1.1", 1.3, 12, 0.98, 0.70, 1.1),
-        AnalysisVariant("v14_cl1.3_t10_g1.00_us0.70_s1.2", 1.3, 10, 1.00, 0.70, 1.2),
-        AnalysisVariant("v5_cl1.5_t8_g1.00_us0.80_s1.0", 1.5, 8, 1.00, 0.80, 1.0),
-        AnalysisVariant("v10_cl1.5_t8_g0.98_us0.80_s1.0", 1.5, 8, 0.98, 0.80, 1.0),
-        AnalysisVariant("v4_cl3_t8_g0.85_us1.50_s1.2", 3.0, 8, 0.85, 1.50, 1.2),
-        AnalysisVariant("v2_cl2.5_t8_g0.95_us1.20_s1.0", 2.5, 8, 0.95, 1.20, 1.0),
+        AnalysisVariant("Balanced_Default_clahe_strong_8x8", 4.0, 8, 1.0, 0.7, 1.0),
+        AnalysisVariant("Low_Contrast_clahe_strong_4x4", 8.0, 4, 1.0, 0.7, 1.0),
+        AnalysisVariant("Low_Contrast_clahe_vstrong_4x4", 14.0, 4, 1.0, 0.7, 1.0),
+        AnalysisVariant("Aggressive_clahe_vstrong_8x8", 15.0, 8, 1.0, 0.7, 1.0),
+        AnalysisVariant("Aggressive_clahe_ultra_8x8", 20.0, 8, 1.0, 0.7, 1.0),
+        AnalysisVariant("Ultra_Aggressive_clahe_ultra_4x4", 30.0, 4, 1.0, 0.7, 1.0),
     ]
     
     def __init__(self, config_file: Optional[str] = None):
@@ -86,9 +99,20 @@ class ConfigManager:
         Args:
             config_file: Path to configuration file (optional)
         """
+        # Auto-locate default config if not provided
+        if config_file is None:
+            # Try to find default_config.json relative to this file
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(current_dir))
+            config_file = os.path.join(project_root, 'configs', 'default_config.json')
+        
         self.config_file = config_file
         self.processing_config = ProcessingConfig()
         self.variants = self.DEFAULT_VARIANTS.copy()
+        
+        # Auto-load config if file exists
+        if self.config_file and os.path.exists(self.config_file):
+            self.load_config()
     
     def load_config(self, config_file: str = None) -> None:
         """

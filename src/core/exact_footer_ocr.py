@@ -13,9 +13,48 @@ import os
 import logging
 import signal
 from functools import wraps
+import sys
 
-# Set Tesseract path (Windows installation)
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Set Tesseract path - try bundled version first, then system paths
+def setup_tesseract_path():
+    """Setup Tesseract executable path - try bundled first, then system installations."""
+    
+    # If running as executable (PyInstaller), try bundled tesseract first
+    if getattr(sys, 'frozen', False):
+        # Running as executable
+        bundle_dir = sys._MEIPASS
+        bundled_tesseract = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe')
+        if os.path.exists(bundled_tesseract):
+            print(f"Using bundled Tesseract: {bundled_tesseract}")
+            return bundled_tesseract
+    else:
+        # Running as script, try relative path first
+        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        bundled_tesseract = os.path.join(script_dir, 'tesseract', 'tesseract.exe')
+        if os.path.exists(bundled_tesseract):
+            print(f"Using bundled Tesseract: {bundled_tesseract}")
+            return bundled_tesseract
+    
+    # Try common system installation paths
+    common_paths = [
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        r'C:\Tesseract-OCR\tesseract.exe',
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            print(f"Using system Tesseract: {path}")
+            return path
+    
+    # If nothing found, let pytesseract try its default
+    print("Warning: Tesseract not found in common locations. Trying default...")
+    return None
+
+# Setup Tesseract path
+tesseract_path = setup_tesseract_path()
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
 # Timeout exception
 class TimeoutError(Exception):

@@ -274,13 +274,18 @@ class MainWindow(QMainWindow):
         self.annotate_check = QCheckBox("Annotate measurements")
         self.annotate_check.setChecked(True)
         
+        self.save_all_data_check = QCheckBox("Save all data files (CSV, plots, overlays)")
+        self.save_all_data_check.setChecked(False)  # Default: only save PDF
+        self.save_all_data_check.setToolTip("When unchecked, only the final PDF report is saved")
+        
         processing_layout.addWidget(QLabel("Min grain area:"), 0, 0)
         processing_layout.addWidget(self.min_area_spinbox, 0, 1)
         processing_layout.addWidget(self.apply_cap_check, 1, 0, 1, 2)
         processing_layout.addWidget(QLabel("Feret cap:"), 2, 0)
         processing_layout.addWidget(self.feret_cap_spinbox, 2, 1)
-        processing_layout.addWidget(self.save_overlays_check, 3, 0, 1, 2)
-        processing_layout.addWidget(self.annotate_check, 4, 0, 1, 2)
+        processing_layout.addWidget(self.save_all_data_check, 3, 0, 1, 2)
+        processing_layout.addWidget(self.save_overlays_check, 4, 0, 1, 2)
+        processing_layout.addWidget(self.annotate_check, 5, 0, 1, 2)
         
         # Connect cap checkbox to enable/disable spinbox
         self.apply_cap_check.toggled.connect(self.feret_cap_spinbox.setEnabled)
@@ -746,9 +751,23 @@ class MainWindow(QMainWindow):
                 'min_area_px': self.min_area_spinbox.value(),
                 'apply_feret_cap': self.apply_cap_check.isChecked(),
                 'feret_cap_um': self.feret_cap_spinbox.value(),
+                'save_all_data': self.save_all_data_check.isChecked(),
                 'save_overlays': self.save_overlays_check.isChecked(),
                 'annotate_measurements': self.annotate_check.isChecked(),
-                'variants': self.config_manager.variants.copy()
+                'variants': self.config_manager.variants.copy(),
+                # Ridge filtering parameters from config
+                'apply_ridge_filtering': self.config_manager.processing_config.apply_ridge_filtering,
+                'ridge_threshold': self.config_manager.processing_config.ridge_threshold,
+                'ridge_tv_weight': self.config_manager.processing_config.ridge_tv_weight,
+                'ridge_percentile': self.config_manager.processing_config.ridge_percentile,
+                'ridge_min_size': self.config_manager.processing_config.ridge_min_size,
+                # Tiling and model parameters from config
+                'enable_tiling': self.config_manager.processing_config.enable_tiling,
+                'tile_size': self.config_manager.processing_config.tile_size,
+                'tile_overlap': self.config_manager.processing_config.tile_overlap,
+                'min_image_size_for_tiling': self.config_manager.processing_config.min_image_size_for_tiling,
+                'model_gpu': self.config_manager.processing_config.model_gpu,
+                'model_cpu': self.config_manager.processing_config.model_cpu
             }
             
             # Create and start analysis worker thread
@@ -1294,9 +1313,23 @@ class MainWindow(QMainWindow):
             'min_area_px': self.min_area_spinbox.value(),
             'apply_feret_cap': self.apply_cap_check.isChecked(),
             'feret_cap_um': self.feret_cap_spinbox.value(),
+            'save_all_data': self.save_all_data_check.isChecked(),
             'save_overlays': self.save_overlays_check.isChecked(),
             'annotate_measurements': self.annotate_check.isChecked(),
-            'variants': self.config_manager.variants.copy()  # All variants run in background
+            'variants': self.config_manager.variants.copy(),  # All variants run in background
+            # Ridge filtering parameters from config
+            'apply_ridge_filtering': self.config_manager.processing_config.apply_ridge_filtering,
+            'ridge_threshold': self.config_manager.processing_config.ridge_threshold,
+            'ridge_tv_weight': self.config_manager.processing_config.ridge_tv_weight,
+            'ridge_percentile': self.config_manager.processing_config.ridge_percentile,
+            'ridge_min_size': self.config_manager.processing_config.ridge_min_size,
+            # Tiling and model parameters from config
+            'enable_tiling': self.config_manager.processing_config.enable_tiling,
+            'tile_size': self.config_manager.processing_config.tile_size,
+            'tile_overlap': self.config_manager.processing_config.tile_overlap,
+            'min_image_size_for_tiling': self.config_manager.processing_config.min_image_size_for_tiling,
+            'model_gpu': self.config_manager.processing_config.model_gpu,
+            'model_cpu': self.config_manager.processing_config.model_cpu
         }
         
         # Create and start analysis worker thread
@@ -1599,6 +1632,8 @@ Processing Time: {results.get('processing_time', 0):.1f}s
         try:
             from core.sam_analysis import GrainAnalyzer
             
+# Remove the executable check - let the analyzer handle device detection
+            
             # Create a temporary analyzer to get device info
             temp_analyzer = GrainAnalyzer()
             device_info = temp_analyzer.get_device_info()
@@ -1620,8 +1655,10 @@ Processing Time: {results.get('processing_time', 0):.1f}s
             self.log_message(f"Processing device detected: {device_text}")
             
         except Exception as e:
-            self.device_label.setText("⚠️ Device detection failed")
-            self.log_message(f"Device detection error: {str(e)}")
+            # Fallback to CPU mode display
+            self.device_label.setText("🖥️ CPU Mode (Safe)")
+            self.log_message(f"Device detection issue - using CPU mode: {str(e)}")
+            self.log_message("💡 CPU mode works perfectly for grain analysis")
 
 
 def main():

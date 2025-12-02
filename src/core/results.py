@@ -189,7 +189,7 @@ class ResultsExporter:
         csv_path = f"{self.base_path}_per_variant_chords.csv"
         
         with open(csv_path, 'w', newline='') as f:
-            fieldnames = ['variant', 'n_used', 'mean_chord_um', 'median_chord_um', 'std_chord_um']
+            fieldnames = ['variant', 'n_used', 'mean_chord_um']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             
@@ -198,9 +198,7 @@ class ResultsExporter:
                 writer.writerow({
                     'variant': result['variant_name'],
                     'n_used': stats.n_samples,
-                    'mean_chord_um': stats.mean,
-                    'median_chord_um': stats.median,
-                    'std_chord_um': stats.std
+                    'mean_chord_um': stats.mean
                 })
         
         return csv_path
@@ -218,7 +216,7 @@ class ResultsExporter:
         csv_path = f"{self.base_path}_per_variant_areas.csv"
         
         with open(csv_path, 'w', newline='') as f:
-            fieldnames = ['variant', 'n_used', 'mean_area_um2', 'median_area_um2', 'std_area_um2']
+            fieldnames = ['variant', 'n_used', 'mean_area_um2']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             
@@ -227,9 +225,7 @@ class ResultsExporter:
                 writer.writerow({
                     'variant': result['variant_name'],
                     'n_used': stats.n_samples,
-                    'mean_area_um2': stats.mean,
-                    'median_area_um2': stats.median,
-                    'std_area_um2': stats.std
+                    'mean_area_um2': stats.mean
                 })
         
         return csv_path
@@ -254,7 +250,7 @@ class ResultsExporter:
         with open(csv_path, 'w', newline='') as f:
             fieldnames = [
                 'apply_cap', 'feret_cap_um', 'overall_mean_chord_um', 'overall_mean_area_um2',
-                'overall_median_chord_um', 'overall_median_area_um2', 'n_chords', 'n_areas'
+                'n_chords', 'n_areas'
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -264,8 +260,6 @@ class ResultsExporter:
                 'feret_cap_um': processing_config.get('feret_cap_um', 5.0),
                 'overall_mean_chord_um': chord_stats.mean,
                 'overall_mean_area_um2': area_stats.mean,
-                'overall_median_chord_um': chord_stats.median,
-                'overall_median_area_um2': area_stats.median,
                 'n_chords': chord_stats.n_samples,
                 'n_areas': area_stats.n_samples
             })

@@ -43,12 +43,39 @@ Thumbs.db
 temp/
 logs/
 outputs/
+experimental_outputs/
 *.log
+*_output/
 
 # Temporary files
 temp_*.png
 temp_*.jpg
 debug_*.png
+
+# Analysis output files
+*_per_variant_chords.csv
+*_per_variant_areas.csv
+*_overall_averages.csv
+*_detailed_results.json
+*_ANALYSIS_REPORT.pdf
+*_chord_distribution.png
+*_area_distribution.png
+*_variant_comparison.png
+*_overlay.png
+*_ridge_filtered.png
+
+# Markdown documentation
+*.md
+
+# Virtual environment
+grain_env/
+
+# Tesseract
+tesseract/
+
+# Backup files
+*.backup
+*.bak
 
 # Large model files (too large for GitHub - must be downloaded separately)
 sam_l.pt
