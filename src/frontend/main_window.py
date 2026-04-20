@@ -155,11 +155,15 @@ class MainWindow(QMainWindow):
         multi_layout = QHBoxLayout()
         self.browse_multi_button = QPushButton("📁 Browse Multiple Images")
         self.browse_multi_button.clicked.connect(self.browse_multiple_images)
+
+        self.browse_folder_button = QPushButton("📂 Add Folder")
+        self.browse_folder_button.clicked.connect(self.browse_image_directory)
         
         self.clear_images_button = QPushButton("🗑️ Clear All")
         self.clear_images_button.clicked.connect(self.clear_image_list)
         
         multi_layout.addWidget(self.browse_multi_button)
+        multi_layout.addWidget(self.browse_folder_button)
         multi_layout.addWidget(self.clear_images_button)
         
         # Image list display
@@ -512,6 +516,54 @@ class MainWindow(QMainWindow):
             self.update_image_list_display()
             self.process_all_button.setEnabled(len(self.image_list) > 0)
             self.log_message(f"📁 Added {len(file_paths)} images to queue (Total: {len(self.image_list)})")
+
+    def browse_image_directory(self):
+        """Browse and add all supported images from a directory."""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Image Directory",
+            ""
+        )
+
+        if not directory:
+            return
+
+        supported_exts = {'.tiff', '.tif', '.png', '.jpg', '.jpeg', '.bmp'}
+        candidate_files = []
+
+        try:
+            for path in Path(directory).iterdir():
+                if path.is_file() and path.suffix.lower() in supported_exts:
+                    candidate_files.append(str(path.resolve()))
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Directory Read Error",
+                f"Could not read directory:\n{directory}\n\nError: {str(e)}"
+            )
+            return
+
+        if not candidate_files:
+            QMessageBox.information(
+                self,
+                "No Images Found",
+                "No supported image files were found in the selected directory."
+            )
+            return
+
+        candidate_files.sort()
+        previous_count = len(self.image_list)
+        for file_path in candidate_files:
+            if file_path not in self.image_list:
+                self.image_list.append(file_path)
+
+        added_count = len(self.image_list) - previous_count
+        self.update_image_list_display()
+        self.process_all_button.setEnabled(len(self.image_list) > 0)
+        self.log_message(
+            f"📂 Added {added_count} images from folder: {os.path.basename(directory)} "
+            f"(Total: {len(self.image_list)})"
+        )
     
     def clear_image_list(self):
         """Clear the image list."""
@@ -616,57 +668,10 @@ class MainWindow(QMainWindow):
             if frame_width <= 0 or frame_width < 0.1:
                 self.log_message(f"❌ Invalid Frame Width detected: {frame_width} μm")
                 self.log_message("⚠️ This image may not be a valid SEM image with proper footer")
-                self.log_message("⏸️ PROMPTING USER for manual Frame Width input...")
-                
-                # Prompt user for manual input
-                from PyQt5.QtWidgets import QInputDialog, QMessageBox
-                
-                # First show a clear explanation
-                image_name = os.path.basename(self.current_image_path)
-                reply = QMessageBox.question(
-                    self,
-                    "⚠️ Frame Width Detection Failed",
-                    f"❌ Could not auto-detect Frame Width for:\n\n"
-                    f"📁 {image_name}\n\n"
-                    f"This may NOT be a valid SEM image, or the footer is unreadable.\n\n"
-                    f"What would you like to do?\n\n"
-                    f"• Click 'Yes' to enter Frame Width manually (if you know it)\n"
-                    f"• Click 'No' to SKIP this image and continue",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No  # Default to No (skip)
-                )
-                
-                if reply == QMessageBox.Yes:
-                    # User wants to enter manually
-                    user_value, ok = QInputDialog.getDouble(
-                        self,
-                        "Enter Frame Width Manually",
-                        f"Enter Frame Width for {image_name}:\n\n"
-                        f"(in micrometers, µm)",
-                        value=21.8,  # Default common value
-                        min=0.1,
-                        max=10000.0,
-                        decimals=2
-                    )
-                    
-                    if ok and user_value > 0.1:
-                        # User provided valid Frame Width
-                        self.frame_width_spinbox.setValue(user_value)
-                        self.log_message(f"✅ User provided Frame Width: {user_value} μm")
-                        frame_width = user_value
-                        # Continue processing with user-provided value
-                    else:
-                        # User cancelled - skip this image
-                        self.log_message("⏭️ User cancelled manual input - skipping image")
-                        self.current_batch_index += 1
-                        QTimer.singleShot(500, self.process_next_image)
-                        return
-                else:
-                    # User chose to skip this image
-                    self.log_message("⏭️ User chose to skip this image")
-                    self.current_batch_index += 1
-                    QTimer.singleShot(500, self.process_next_image)
-                    return
+                self.log_message("⏭️ Batch mode: skipping image to avoid blocking popup prompts")
+                self.current_batch_index += 1
+                QTimer.singleShot(500, self.process_next_image)
+                return
             
             # Step 2: Auto-detect pinholes (ONLY if we have valid frame width)
             self.log_message(f"✅ Valid Frame Width detected: {frame_width} μm")
@@ -866,7 +871,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()  # Update UI
             
             # Use exact footer OCR
-            results = self.exact_ocr.analyze_sem_footer_exact(self.current_image_path)
+            results = self.exact_ocr.analyze_sem_footer_exact(self.current_image_path, timeout=6)
             
             # Restore cursor
             QApplication.restoreOverrideCursor()

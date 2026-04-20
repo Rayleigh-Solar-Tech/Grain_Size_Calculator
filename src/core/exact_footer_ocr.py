@@ -213,7 +213,7 @@ class ExactFooterOCR:
         
         return processed_images
 
-    def perform_ocr_with_multiple_methods(self, footer_img, max_attempts=12):
+    def perform_ocr_with_multiple_methods(self, footer_img, max_attempts=12, per_call_timeout=2):
         """Optimized OCR with only the most effective configurations and early exit."""
         all_results = []
         attempts = 0
@@ -246,7 +246,11 @@ class ExactFooterOCR:
                     return all_results
                 
                 try:
-                    text = pytesseract.image_to_string(processed_img, config=config).strip()
+                    text = pytesseract.image_to_string(
+                        processed_img,
+                        config=config,
+                        timeout=per_call_timeout
+                    ).strip()
                     print(f"DEBUG: OCR result (method {i}, config {j}): '{text[:100]}...' (length: {len(text)})")
                     
                     if text:
@@ -260,6 +264,10 @@ class ExactFooterOCR:
                         if 'FW' in text or 'Fw' in text or 'μm' in text or 'um' in text:
                             print(f"DEBUG: Found Frame Width related text, stopping early")
                             return all_results  # Early exit when we find relevant text
+                except RuntimeError as e:
+                    # pytesseract raises RuntimeError on timeout; continue to next config.
+                    print(f"DEBUG: OCR timeout/error (method {i}, config {j}): {e}")
+                    continue
                 except Exception as e:
                     print(f"DEBUG: OCR error (method {i}, config {j}): {e}")
                     continue
@@ -351,13 +359,16 @@ class ExactFooterOCR:
         
         return metadata
 
-    def _analyze_sem_footer_internal(self, image_path):
+    def _analyze_sem_footer_internal(self, image_path, per_call_timeout=2):
         """Internal method to analyze SEM footer (wrapped with timeout)."""
         # Extract footer region
         footer_region, image_size = self.extract_footer_region(image_path)
         
         # Perform OCR with multiple methods
-        ocr_results = self.perform_ocr_with_multiple_methods(footer_region)
+        ocr_results = self.perform_ocr_with_multiple_methods(
+            footer_region,
+            per_call_timeout=per_call_timeout
+        )
         
         if not ocr_results:
             return {'error': 'No OCR results obtained', 'image_size': image_size}
@@ -394,10 +405,13 @@ class ExactFooterOCR:
             if not is_valid:
                 return {'error': f'Invalid SEM image: {validation_msg}'}
             
-            # STEP 2: Wrap the internal method with timeout
-            wrapped_func = timeout_handler(self._analyze_sem_footer_internal, timeout_duration=timeout)
-            result = wrapped_func(image_path)
-            return result
+            # STEP 2: Use per-call OCR timeout to prevent long-running Tesseract calls
+            # from accumulating orphan threads during batch processing.
+            per_call_timeout = max(1, int(timeout / 4))
+            return self._analyze_sem_footer_internal(
+                image_path,
+                per_call_timeout=per_call_timeout
+            )
             
         except Exception as e:
             error_msg = f"Error analyzing SEM footer: {e}"
