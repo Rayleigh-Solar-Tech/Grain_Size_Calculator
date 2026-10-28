@@ -92,6 +92,10 @@ def timeout_handler(func, timeout_duration=10):
 class ExactFooterOCR:
     """Exact OCR processor for SEM image footers."""
     
+    # Multipliers for a Frame Width unit read after the number.
+    # No unit, µm, μm or um means the value is already in µm.
+    FW_UNIT_TO_UM = {'nm': 0.001, 'mm': 1000.0}
+    
     def __init__(self):
         self.logger = logging.getLogger(__name__)
     
@@ -225,9 +229,10 @@ class ExactFooterOCR:
         print(f"DEBUG: Got {len(processed_imgs)} preprocessed images")
         
         # Only the most effective OCR configurations (4 instead of 13)
+        # The whitelist includes 'n' so a Frame Width given in nm can be read as "nm".
         ocr_configs = [
-            '--psm 6 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single block with whitelist
-            '--psm 7 -c tessedit_char_whitelist=0123456789.,μumkVPaFWfwBSDSEETDxX:- ',  # Single line with whitelist
+            '--psm 6 -c tessedit_char_whitelist=0123456789.,μumnkVPaFWfwBSDSEETDxX:- ',  # Single block with whitelist
+            '--psm 7 -c tessedit_char_whitelist=0123456789.,μumnkVPaFWfwBSDSEETDxX:- ',  # Single line with whitelist
             '--psm 6',  # Single block without whitelist
             '--psm 7',  # Single line without whitelist
         ]
@@ -285,26 +290,19 @@ class ExactFooterOCR:
         
         # Combine all text results for analysis
         all_text = " ".join([result['text'] for result in text_results])
-        best_result = text_results[0]['text'] if text_results else ""
         
         print(f"DEBUG: Parsing metadata from combined text: '{all_text[:200]}...'")
-        print(f"DEBUG: Best result: '{best_result[:100]}...')")
         
-        # Debug: Show what's around FW in the text
         import re
-        fw_context = re.findall(r'.{0,10}FW.{0,10}', best_result, re.IGNORECASE)
-        if fw_context:
-            print(f"DEBUG: Found FW context: {fw_context}")
-        else:
-            print("DEBUG: No FW found in text")
         
         # Precise regex patterns for SEM footer data - improved for Frame Width detection
         patterns = {
             'fw_um': [
                 # SIMPLE FW (Frame Width) patterns only - focus on what matters
-                r'FW[\s:]*([0-9]+\.?[0-9]*)',                    # FW 19.9 or FW: 19.9
-                r'Fw[\s:]*([0-9]+\.?[0-9]*)',                    # Fw 19.9 or Fw: 19.9
-                r'F\s*W[\s:]*([0-9]+\.?[0-9]*)',                 # F W 19.9 (spaced)
+                # The optional second group captures the unit so nm/mm values can be converted
+                r'FW[\s:]*([0-9]+\.?[0-9]*)\s*(nm|mm|[uμµ]m)?',   # FW 19.9 or FW: 19.9 µm
+                r'Fw[\s:]*([0-9]+\.?[0-9]*)\s*(nm|mm|[uμµ]m)?',   # Fw 19.9 or Fw: 19.9 µm
+                r'F\s*W[\s:]*([0-9]+\.?[0-9]*)\s*(nm|mm|[uμµ]m)?', # F W 19.9 (spaced)
                 
                 # Pattern for SEM footer context: magnification x Frame_Width voltage
                 r'[0-9]+x\s*([0-9]+\.?[0-9]*)(?:um|μm|m)\s*[0-9]+[kK][Vv]',  # 4300x 120um 10kV - extract Frame Width
@@ -332,6 +330,23 @@ class ExactFooterOCR:
             ],
         }
         
+        # Parse the OCR pass that contains a Frame Width reading. OCR stops early on that
+        # pass, so it is usually the last result rather than the first.
+        best_result = text_results[0]['text']
+        for result in text_results:
+            if any(re.search(pattern, result['text'], re.IGNORECASE) for pattern in patterns['fw_um']):
+                best_result = result['text']
+                break
+        
+        print(f"DEBUG: Best result: '{best_result[:100]}...')")
+        
+        # Debug: Show what's around FW in the text
+        fw_context = re.findall(r'.{0,10}FW.{0,10}', best_result, re.IGNORECASE)
+        if fw_context:
+            print(f"DEBUG: Found FW context: {fw_context}")
+        else:
+            print("DEBUG: No FW found in text")
+        
         # Extract metadata using patterns
         for field, field_patterns in patterns.items():
             print(f"DEBUG: Looking for {field}...")
@@ -340,10 +355,16 @@ class ExactFooterOCR:
                 if matches:
                     print(f"DEBUG: Pattern {i} for {field} matched: {matches}")
                     try:
+                        # Patterns with a unit group return (value, unit) tuples
+                        value_str, unit = matches[0], ''
+                        if isinstance(value_str, tuple):
+                            value_str, unit = value_str
                         # Clean up the matched value
-                        value_str = matches[0].replace(',', '').replace(' ', '')
+                        value_str = value_str.replace(',', '').replace(' ', '')
                         if field == 'magnification':
                             metadata[field] = int(float(value_str))
+                        elif field == 'fw_um':
+                            metadata[field] = float(value_str) * self.FW_UNIT_TO_UM.get(unit.lower(), 1.0)
                         else:
                             metadata[field] = float(value_str)
                         print(f"DEBUG: Successfully extracted {field} = {metadata[field]}")
