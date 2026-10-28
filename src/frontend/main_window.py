@@ -200,7 +200,10 @@ class MainWindow(QMainWindow):
         self.auto_ocr_check.setToolTip("Automatically extract Frame Width from SEM image footer using OCR")
         
         self.frame_width_spinbox = QDoubleSpinBox()
-        self.frame_width_spinbox.setRange(0.1, 1000.0)
+        # 0.0 means "not detected" - the minimum must allow it, otherwise Qt clamps it to a
+        # real-looking value and the validity checks let it through.
+        # The maximum matches the 10000 μm sanity check applied to OCR results.
+        self.frame_width_spinbox.setRange(0.0, 10000.0)
         self.frame_width_spinbox.setValue(21.8)
         self.frame_width_spinbox.setSuffix(" µm")
         self.frame_width_spinbox.setEnabled(False)
@@ -1309,6 +1312,10 @@ class MainWindow(QMainWindow):
         """Start the grain analysis process."""
         if not self.current_image_path or not os.path.exists(self.current_image_path):
             QMessageBox.warning(self, "Warning", "Please select a valid image file first.")
+            return
+        
+        if self.frame_width_spinbox.value() <= 0:
+            QMessageBox.warning(self, "Warning", "Please set a valid Frame Width first.")
             return
         
         # Prepare analysis parameters (using all variants but hidden from UI)
